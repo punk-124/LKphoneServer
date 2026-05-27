@@ -98,6 +98,7 @@ app.get('/', async (c) => {
   const userId = authUserId
   const key = c.req.query('key')
   const lastSync = c.req.query('last_sync')
+  const optional = c.req.query('optional') === '1' || c.req.query('optional') === 'true'
 
   if (!userId) {
     return jsonError(c, 'Missing authenticated user id', 401)
@@ -120,7 +121,10 @@ app.get('/', async (c) => {
     const result = await c.env.DB.prepare(query).bind(...params).all()
     if (key) {
       const row = result.results?.[0]
-      if (!row) return jsonError(c, 'No synced backup found', 404)
+      if (!row) {
+        if (optional) return c.json({ status: 'success', key, value: null })
+        return jsonError(c, 'No synced backup found', 404)
+      }
 
       const stored = parseStoredSyncValue(key, row.value)
       if (stored.parsed) {

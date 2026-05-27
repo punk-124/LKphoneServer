@@ -29,7 +29,6 @@ app.post('/', async (c) => {
 
   const body = await c.req.json()
   const authUserId = String(auth.user?.id || '').trim()
-  const requestedUserId = String(body.user_id || body.userId || '').trim()
   const userId = authUserId
   const shouldReplace = body?.replace !== false
 
@@ -52,10 +51,6 @@ app.post('/', async (c) => {
 
   if (!userId) {
     return jsonError(c, 'Missing authenticated user id', 401)
-  }
-
-  if (requestedUserId && requestedUserId !== userId) {
-    return jsonError(c, 'user_id does not match authenticated user', 403)
   }
 
   if (validRecords.length === 0 && deleteKeys.length === 0) {
@@ -100,17 +95,12 @@ app.get('/', async (c) => {
   if (auth.error) return auth.error
 
   const authUserId = String(auth.user?.id || '').trim()
-  const requestedUserId = String(c.req.query('user_id') || '').trim()
   const userId = authUserId
   const key = c.req.query('key')
   const lastSync = c.req.query('last_sync')
 
   if (!userId) {
     return jsonError(c, 'Missing authenticated user id', 401)
-  }
-
-  if (requestedUserId && requestedUserId !== userId) {
-    return jsonError(c, 'user_id does not match authenticated user', 403)
   }
 
   try {

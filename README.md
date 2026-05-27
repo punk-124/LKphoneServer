@@ -25,16 +25,14 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 
 2. **Configure Cloudflare**:
    - Create a Cloudflare account if you don't have one
-   - Create a D1 database named `lkphone-db`
-   - Update `wrangler.toml` with your database IDs
+   - The D1 database can be provisioned automatically from `wrangler.toml`
 
-3. **Initialize database**:
-   Run the `/init` endpoint once to create all tables
-
-4. **Deploy**:
+3. **Apply migrations and deploy**:
    ```bash
    npm run deploy
    ```
+
+   This will apply D1 migrations first, then deploy the Worker.
 
 ## API Endpoints
 
@@ -62,16 +60,25 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 
 ### Health Check
 - `GET /health`: Check server status
+- `GET /init`: Legacy database init endpoint, usually not needed once migrations are used
 
 ## Environment Variables
 
 - `DB`: Cloudflare D1 database binding
-- `KV`: Cloudflare KV namespace binding (optional for caching)
 
 ## Local Development
 
 ```bash
 npm run dev
+```
+
+## Database Migrations
+
+Initial schema lives in [migrations/0001_initial.sql](./migrations/0001_initial.sql).
+Cloudflare applies migrations with:
+
+```bash
+wrangler d1 migrations apply DB --remote
 ```
 
 ## Deployment

@@ -1,5 +1,3 @@
--- Source-of-truth schema mirrored in migrations/0001_initial.sql
-
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id TEXT UNIQUE NOT NULL,

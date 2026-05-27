@@ -5,13 +5,14 @@
   "main": "index.js",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "cf-typegen": "wrangler types",
+    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy"
   },
   "dependencies": {
     "hono": "^4.0.0",
     "@cloudflare/workers-types": "^4.0.0"
   },
   "devDependencies": {
-    "wrangler": "^3.0.0"
+    "wrangler": "^4.95.0"
   }
 }

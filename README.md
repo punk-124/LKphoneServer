@@ -60,7 +60,6 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 
 ### Health Check
 - `GET /health`: Check server status
-- `GET /init`: Legacy database init endpoint, usually not needed once migrations are used
 
 ## Environment Variables
 
@@ -74,7 +73,7 @@ npm run dev
 
 ## Database Migrations
 
-Initial schema lives in [migrations/0001_initial.sql](./migrations/0001_initial.sql).
+Schema lives in [migrations/0001_initial.sql](./migrations/0001_initial.sql).
 Cloudflare applies migrations with:
 
 ```bash

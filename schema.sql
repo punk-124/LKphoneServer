@@ -1,0 +1,88 @@
+-- Create users table
+CREATE TABLE IF NOT EXISTS users (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT UNIQUE NOT NULL,
+  username TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create resources table
+CREATE TABLE IF NOT EXISTS resources (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  uploader_name TEXT,
+  category TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  preview_image_url TEXT,
+  filename TEXT,
+  mime_type TEXT,
+  size_bytes INTEGER DEFAULT 0,
+  file_type TEXT,
+  content TEXT,
+  content_encoding TEXT DEFAULT 'text',
+  downloads INTEGER DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+-- Create forums table
+CREATE TABLE IF NOT EXISTS forums (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  title TEXT NOT NULL,
+  description TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create comments table
+CREATE TABLE IF NOT EXISTS comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  forum_id INTEGER,
+  user_id TEXT NOT NULL,
+  parent_id INTEGER,
+  content TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (forum_id) REFERENCES forums(id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id),
+  FOREIGN KEY (parent_id) REFERENCES comments(id)
+);
+
+-- Create groups table
+CREATE TABLE IF NOT EXISTS groups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create group members table
+CREATE TABLE IF NOT EXISTS group_members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  user_id TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (group_id) REFERENCES groups(id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+-- Create messages table
+CREATE TABLE IF NOT EXISTS messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  group_id INTEGER NOT NULL,
+  user_id TEXT NOT NULL,
+  content TEXT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (group_id) REFERENCES groups(id),
+  FOREIGN KEY (user_id) REFERENCES users(user_id)
+);
+
+-- Create user data table for sync
+CREATE TABLE IF NOT EXISTS user_data (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  value TEXT NOT NULL,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(user_id),
+  UNIQUE (user_id, key)
+);

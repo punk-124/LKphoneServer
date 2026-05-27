@@ -55,8 +55,8 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 - `GET /groups/:id/messages`: Get group messages
 
 ### User Data Sync
-- `POST /sync`: Store user data
-- `GET /sync`: Get user data for sync
+- `POST /sync`: Store the authenticated user's full backup snapshot
+- `GET /sync`: Get the authenticated user's backup for sync
 
 ### Health Check
 - `GET /health`: Check server status
@@ -64,6 +64,13 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 ## Environment Variables
 
 - `DB`: Cloudflare D1 database binding
+- `AUTH_PUBLIC_KEY_PEM` or `JWT_PUBLIC_KEY_PEM`: RSA public key used to verify login JWTs
+
+## Sync Auth Notes
+
+- `/sync` now requires `Authorization: Bearer <login-jwt>`
+- The server ignores arbitrary cross-user sync attempts and only reads/writes the authenticated user's backup space
+- Uploads are treated as full snapshot replacement for that user
 
 ## Local Development
 

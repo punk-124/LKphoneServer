@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { requireAuth } from '../lib/auth'
 import { ensureUserExists } from '../lib/db'
 import { jsonError } from '../lib/http'
 
@@ -23,8 +24,14 @@ const parseStoredSyncValue = (key, value) => {
 }
 
 app.post('/', async (c) => {
+  const auth = await requireAuth(c)
+  if (auth.error) return auth.error
+
   const body = await c.req.json()
-  const userId = String(body.user_id || body.userId || 'default_user').trim()
+  const authUserId = String(auth.user?.id || '').trim()
+  const requestedUserId = String(body.user_id || body.userId || '').trim()
+  const userId = authUserId
+  const shouldReplace = body?.replace !== false
 
   const records = Array.isArray(body.entries)
     ? body.entries.map((entry) => ({
@@ -39,13 +46,35 @@ app.post('/', async (c) => {
   const validRecords = records.filter((record) =>
     record.key && record.value !== undefined && record.value !== null
   )
+  const deleteKeys = Array.isArray(body.deleteKeys)
+    ? body.deleteKeys.map((key) => String(key || '').trim()).filter(Boolean)
+    : []
 
-  if (!userId || validRecords.length === 0) {
-    return jsonError(c, 'Missing user_id or sync records')
+  if (!userId) {
+    return jsonError(c, 'Missing authenticated user id', 401)
+  }
+
+  if (requestedUserId && requestedUserId !== userId) {
+    return jsonError(c, 'user_id does not match authenticated user', 403)
+  }
+
+  if (validRecords.length === 0 && deleteKeys.length === 0) {
+    return jsonError(c, 'Missing sync records')
   }
 
   try {
-    await ensureUserExists(c.env.DB, userId, userId)
+    await ensureUserExists(c.env.DB, userId, auth.user.username || userId)
+
+    // Full backup mode starts with a replace batch, then appends subsequent batches.
+    if (shouldReplace) {
+      await c.env.DB.prepare('DELETE FROM user_data WHERE user_id = ?').bind(userId).run()
+    } else if (deleteKeys.length > 0) {
+      const deleteStatement = c.env.DB.prepare('DELETE FROM user_data WHERE user_id = ? AND key = ?')
+      const deleteBatches = deleteKeys.map((key) => deleteStatement.bind(userId, key))
+      for (let i = 0; i < deleteBatches.length; i += 50) {
+        await c.env.DB.batch(deleteBatches.slice(i, i + 50))
+      }
+    }
 
     const statement = c.env.DB.prepare(`
       INSERT OR REPLACE INTO user_data (user_id, key, value, updated_at)
@@ -60,16 +89,29 @@ app.post('/', async (c) => {
       await c.env.DB.batch(boundStatements.slice(i, i + 50))
     }
 
-    return c.json({ status: 'success', count: validRecords.length })
+    return c.json({ status: 'success', count: validRecords.length, deleted: deleteKeys.length })
   } catch (error) {
     return c.json({ status: 'error', message: error.message })
   }
 })
 
 app.get('/', async (c) => {
-  const userId = String(c.req.query('user_id') || 'default_user').trim()
+  const auth = await requireAuth(c)
+  if (auth.error) return auth.error
+
+  const authUserId = String(auth.user?.id || '').trim()
+  const requestedUserId = String(c.req.query('user_id') || '').trim()
+  const userId = authUserId
   const key = c.req.query('key')
   const lastSync = c.req.query('last_sync')
+
+  if (!userId) {
+    return jsonError(c, 'Missing authenticated user id', 401)
+  }
+
+  if (requestedUserId && requestedUserId !== userId) {
+    return jsonError(c, 'user_id does not match authenticated user', 403)
+  }
 
   try {
     let query = 'SELECT * FROM user_data WHERE user_id = ?'

@@ -36,6 +36,68 @@ const safeJsonParse = (value, fallback) => {
 
 const parseTakeover = (row) => safeJsonParse(row?.takeover_json, {})
 
+const parseTimeToMinutes = (value) => {
+  const text = String(value || '').trim()
+  if (!/^([01]\d|2[0-3]):[0-5]\d$/.test(text)) return null
+  const [hour, minute] = text.split(':').map(Number)
+  return hour * 60 + minute
+}
+
+const isWithinQuietHours = (startValue, endValue, date = new Date()) => {
+  const start = parseTimeToMinutes(startValue)
+  const end = parseTimeToMinutes(endValue)
+  if (start === null || end === null || start === end) return false
+
+  const current = date.getHours() * 60 + date.getMinutes()
+  if (start < end) {
+    return current >= start && current < end
+  }
+  return current >= start || current < end
+}
+
+const getClientMinutesOfDay = (now, timeZone, utcOffsetMinutes) => {
+  const zone = String(timeZone || '').trim()
+  if (zone) {
+    try {
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: zone,
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }).formatToParts(new Date(now))
+      const hour = Number(parts.find((part) => part.type === 'hour')?.value)
+      const minute = Number(parts.find((part) => part.type === 'minute')?.value)
+      if (Number.isFinite(hour) && Number.isFinite(minute)) {
+        return (hour % 24) * 60 + minute
+      }
+    } catch {
+      // Fall through to numeric offset.
+    }
+  }
+
+  const offset = Number(utcOffsetMinutes)
+  if (Number.isFinite(offset) && offset >= -14 * 60 && offset <= 14 * 60) {
+    const localMs = now + offset * 60 * 1000
+    const localDate = new Date(localMs)
+    return localDate.getUTCHours() * 60 + localDate.getUTCMinutes()
+  }
+
+  const fallbackDate = new Date(now)
+  return fallbackDate.getHours() * 60 + fallbackDate.getMinutes()
+}
+
+const isWithinClientQuietHours = (startValue, endValue, now, timeZone, utcOffsetMinutes) => {
+  const start = parseTimeToMinutes(startValue)
+  const end = parseTimeToMinutes(endValue)
+  if (start === null || end === null || start === end) return false
+
+  const current = getClientMinutesOfDay(now, timeZone, utcOffsetMinutes)
+  if (start < end) {
+    return current >= start && current < end
+  }
+  return current >= start || current < end
+}
+
 const insertWakeOutbox = async (env, userId, payload, now) => {
   const outboxId = `agt_out_${now}_${crypto.randomUUID()}`
   await env.DB.prepare(`
@@ -182,6 +244,15 @@ const runAgentScheduler = async (env) => {
     const takeover = parseTakeover(state)
     if (takeover.proactiveWechat === false) continue
     if (dispatchedWechatUsers.has(state.user_id)) continue
+    if (
+      isWithinClientQuietHours(
+        state.proactive_quiet_start,
+        state.proactive_quiet_end,
+        now,
+        state.client_time_zone,
+        state.client_utc_offset_minutes
+      )
+    ) continue
 
     const frequency = Math.max(0.01, Number(state.chat_frequency || 2))
     const minIntervalMs = Math.max(0, Number(state.proactive_min_interval_hours || 6)) * 60 * 60 * 1000

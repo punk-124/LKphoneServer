@@ -46,6 +46,21 @@ const normalizeNumber = (value, fallback, min = 0) => {
 
 const normalizeString = (value, max = 260) => String(value || '').trim().slice(0, max)
 
+const normalizeTimeValue = (value) => {
+  const text = normalizeString(value, 5)
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(text) ? text : null
+}
+
+const normalizeTimeZone = (value) => {
+  const text = normalizeString(value, 80)
+  return /^[A-Za-z0-9_+\-./]+$/.test(text) ? text : null
+}
+
+const normalizeUtcOffsetMinutes = (value) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= -14 * 60 && parsed <= 14 * 60 ? Math.floor(parsed) : null
+}
+
 const normalizeParticipants = (value) => (
   Array.isArray(value)
     ? value.map((item) => normalizeString(item, 120)).filter(Boolean).slice(0, 24)
@@ -198,16 +213,21 @@ app.put('/wechat/proactive-state', async (c) => {
     await c.env.DB.prepare(`
       INSERT INTO agent_wechat_proactive_state (
         user_id, profile_id, chat_id, character_id, proactive_chat, chat_frequency,
-        proactive_min_interval_hours, proactive_max_streak, last_message_at,
+        proactive_min_interval_hours, proactive_max_streak, proactive_quiet_start,
+        proactive_quiet_end, client_time_zone, client_utc_offset_minutes, last_message_at,
         last_user_reply_at, last_ai_message_at, last_ai_proactive_message_at,
         today_proactive_count, proactive_since_user_reply, is_active, is_group, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, profile_id, chat_id, character_id) DO UPDATE SET
         proactive_chat = excluded.proactive_chat,
         chat_frequency = excluded.chat_frequency,
         proactive_min_interval_hours = excluded.proactive_min_interval_hours,
         proactive_max_streak = excluded.proactive_max_streak,
+        proactive_quiet_start = excluded.proactive_quiet_start,
+        proactive_quiet_end = excluded.proactive_quiet_end,
+        client_time_zone = excluded.client_time_zone,
+        client_utc_offset_minutes = excluded.client_utc_offset_minutes,
         last_message_at = excluded.last_message_at,
         last_user_reply_at = excluded.last_user_reply_at,
         last_ai_message_at = excluded.last_ai_message_at,
@@ -226,6 +246,10 @@ app.put('/wechat/proactive-state', async (c) => {
       normalizeNumber(item.chatFrequency, 2, 0.01),
       normalizeNumber(item.proactiveMinIntervalHours, 6, 0),
       Math.max(1, Math.floor(normalizeNumber(item.proactiveMaxStreak, 1, 1))),
+      normalizeTimeValue(item.proactiveQuietStart),
+      normalizeTimeValue(item.proactiveQuietEnd),
+      normalizeTimeZone(item.clientTimeZone),
+      normalizeUtcOffsetMinutes(item.clientUtcOffsetMinutes),
       Math.floor(normalizeNumber(item.lastMessageAt, 0, 0)),
       Math.floor(normalizeNumber(item.lastUserReplyAt, 0, 0)),
       Math.floor(normalizeNumber(item.lastAiMessageAt, 0, 0)),

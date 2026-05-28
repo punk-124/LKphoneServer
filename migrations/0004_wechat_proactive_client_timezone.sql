@@ -1,0 +1,2 @@
+ALTER TABLE agent_wechat_proactive_state ADD COLUMN client_time_zone TEXT;
+ALTER TABLE agent_wechat_proactive_state ADD COLUMN client_utc_offset_minutes INTEGER;

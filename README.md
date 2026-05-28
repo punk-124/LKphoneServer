@@ -1,19 +1,21 @@
 # LKphone Server
 
-Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
+Backend server for LKphone app, deployed on Cloudflare Workers with D1 database and R2 backup storage.
 
 ## Features
 
 1. **Resource Management**: Store, query, and modify resources by category
 2. **Forum Comments**: Get, add, delete, and reply to forum comments
 3. **Group Chat**: Support instant messaging between group members
-4. **User Data Sync**: Store and sync user data across devices
+4. **Authenticated APIs**: Verify login JWTs for protected server features
+5. **R2 Backups**: Store and restore user-scoped backup objects in Cloudflare R2
 
 ## Tech Stack
 
 - Node.js
 - Cloudflare Workers
 - Cloudflare D1 (SQLite database)
+- Cloudflare R2 (object storage)
 - Hono (lightweight web framework)
 
 ## Setup
@@ -26,13 +28,14 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 2. **Configure Cloudflare**:
    - Create a Cloudflare account if you don't have one
    - The D1 database can be provisioned automatically from `wrangler.toml`
+   - The backup bucket is created by `npm run deploy` if it does not already exist
 
 3. **Apply migrations and deploy**:
    ```bash
    npm run deploy
    ```
 
-   This will apply D1 migrations first, then deploy the Worker.
+   This will ensure the R2 bucket exists, apply D1 migrations, then deploy the Worker.
 
 ## API Endpoints
 
@@ -54,23 +57,21 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 - `POST /groups/:id/messages`: Send a message to a group
 - `GET /groups/:id/messages`: Get group messages
 
-### User Data Sync
-- `POST /sync`: Store the authenticated user's full backup snapshot
-- `GET /sync`: Get the authenticated user's backup for sync
-
 ### Health Check
 - `GET /health`: Check server status
+
+### Backups
+- `GET /backups/health`: Check authenticated R2 backup access
+- `PUT /backups/object?key=...`: Upload a backup object
+- `GET /backups/object?key=...`: Download a backup object
+- `DELETE /backups/object?key=...`: Delete a backup object
 
 ## Environment Variables
 
 - `DB`: Cloudflare D1 database binding
+- `BACKUPS`: Cloudflare R2 bucket binding
 - `AUTH_PUBLIC_KEY_PEM` or `JWT_PUBLIC_KEY_PEM`: RSA public key used to verify login JWTs
-
-## Sync Auth Notes
-
-- `/sync` now requires `Authorization: Bearer <login-jwt>`
-- The server ignores arbitrary cross-user sync attempts and only reads/writes the authenticated user's backup space
-- Uploads are treated as full snapshot replacement for that user
+- `LKPHONE_BACKUP_BUCKET`: Optional deploy-time bucket name override for `npm run r2:ensure`
 
 ## Local Development
 

@@ -17,3 +17,7 @@ qwIDAQAB
 binding = "DB"
 database_name = "lkphone-db"
 migrations_dir = "migrations"
+
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "lkphone-backups"

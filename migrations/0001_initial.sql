@@ -78,3 +78,17 @@ CREATE TABLE IF NOT EXISTS user_data (
   FOREIGN KEY (user_id) REFERENCES users(user_id),
   UNIQUE (user_id, key)
 );
+
+CREATE TABLE IF NOT EXISTS backups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id TEXT NOT NULL,
+  base_path TEXT NOT NULL,
+  object_key TEXT NOT NULL,
+  size_bytes INTEGER DEFAULT 0,
+  checksum TEXT,
+  content_type TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(user_id),
+  UNIQUE (user_id, object_key)
+);

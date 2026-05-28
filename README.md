@@ -64,13 +64,13 @@ All agent endpoints require `Authorization: Bearer <login-jwt>`.
 - `GET /agent/status`: Get hosted agent status, pending task count, and pending outbox count
 - `GET /agent/config`: Get hosted agent config
 - `PUT /agent/config`: Enable/disable hosted agent and takeover scopes
-- `GET /agent/generation-config`: Get hosted generation config status; API keys are never returned
-- `PUT /agent/generation-config`: Save user-authorized AI API URL, API key, and model for offline generation
+- `PUT /agent/wechat/proactive-state`: Upsert lightweight WeChat proactive chat candidates from the client
+- `PUT /agent/lifeline/triggers`: Upsert lightweight lifeline trigger schedules from the client
 - `POST /agent/tasks`: Create a due task, such as a lifeline reminder
 - `GET /agent/outbox`: Pull pending server-side agent actions
 - `POST /agent/outbox/:id/ack`: Mark an outbox action as consumed
 
-Cloudflare Cron (`*/5 * * * *`) checks due tasks and random check-ins, then writes actions into `agent_outbox`.
+Cloudflare Cron (`*/5 * * * *`) checks due tasks, synced lifeline triggers, synced WeChat proactive candidates, and random check-ins, then writes `wake_request` actions into `agent_outbox`.
 
 ## Environment Variables
 

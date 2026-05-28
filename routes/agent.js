@@ -39,6 +39,19 @@ const pickNextCheckinAt = (minIntervalMs, maxIntervalMs, base = nowMs()) => {
   return base + min + Math.floor(Math.random() * (max - min + 1))
 }
 
+const normalizeNumber = (value, fallback, min = 0) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= min ? parsed : fallback
+}
+
+const normalizeString = (value, max = 260) => String(value || '').trim().slice(0, max)
+
+const normalizeParticipants = (value) => (
+  Array.isArray(value)
+    ? value.map((item) => normalizeString(item, 120)).filter(Boolean).slice(0, 24)
+    : []
+)
+
 const normalizeConfigRow = (row) => {
   if (!row) {
     return {
@@ -62,22 +75,9 @@ const normalizeConfigRow = (row) => {
   }
 }
 
-const normalizeGenerationRow = (row) => ({
-  enabled: Number(row?.enabled || 0) === 1,
-  baseUrl: String(row?.base_url || ''),
-  model: String(row?.model || ''),
-  hasApiKey: Boolean(row?.api_key),
-  updatedAt: row?.updated_at ? Number(row.updated_at) : null,
-})
-
 const readAgentConfig = async (db, userId) => {
   const row = await db.prepare('SELECT * FROM agent_configs WHERE user_id = ?').bind(userId).first()
   return normalizeConfigRow(row)
-}
-
-const readGenerationConfig = async (db, userId) => {
-  const row = await db.prepare('SELECT * FROM agent_generation_configs WHERE user_id = ?').bind(userId).first()
-  return normalizeGenerationRow(row)
 }
 
 const requireAgentAuth = async (c) => {
@@ -93,7 +93,6 @@ app.get('/status', async (c) => {
   if (auth.error) return auth.error
 
   const config = await readAgentConfig(c.env.DB, auth.user.id)
-  const generation = await readGenerationConfig(c.env.DB, auth.user.id)
   const pendingResult = await c.env.DB.prepare(`
     SELECT COUNT(*) AS count FROM agent_tasks WHERE user_id = ? AND status = 'pending'
   `).bind(auth.user.id).first()
@@ -106,7 +105,6 @@ app.get('/status', async (c) => {
     data: {
       server: 'lkphone-server',
       agent: config,
-      generation,
       pendingTasks: Number(pendingResult?.count || 0),
       pendingOutbox: Number(outboxResult?.count || 0),
       now: nowMs(),
@@ -163,51 +161,6 @@ app.put('/config', async (c) => {
   return c.json({ status: 'success', data: await readAgentConfig(c.env.DB, auth.user.id) })
 })
 
-app.get('/generation-config', async (c) => {
-  const auth = await requireAgentAuth(c)
-  if (auth.error) return auth.error
-  return c.json({ status: 'success', data: await readGenerationConfig(c.env.DB, auth.user.id) })
-})
-
-app.put('/generation-config', async (c) => {
-  const auth = await requireAgentAuth(c)
-  if (auth.error) return auth.error
-
-  const body = await c.req.json()
-  const enabled = body.enabled === true
-  const baseUrl = String(body.baseUrl || '').trim()
-  const model = String(body.model || '').trim()
-  const apiKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : ''
-
-  if (enabled && !baseUrl) return jsonError(c, 'Missing AI API URL')
-  if (enabled && !model) return jsonError(c, 'Missing model')
-  if (enabled && !apiKey) return jsonError(c, 'Missing API key')
-
-  const ts = nowMs()
-  await c.env.DB.prepare(`
-    INSERT INTO agent_generation_configs (
-      user_id, enabled, base_url, api_key, model, created_at, updated_at
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      enabled = excluded.enabled,
-      base_url = excluded.base_url,
-      api_key = excluded.api_key,
-      model = excluded.model,
-      updated_at = excluded.updated_at
-  `).bind(
-    auth.user.id,
-    enabled ? 1 : 0,
-    baseUrl,
-    apiKey,
-    model,
-    ts,
-    ts
-  ).run()
-
-  return c.json({ status: 'success', data: await readGenerationConfig(c.env.DB, auth.user.id) })
-})
-
 app.post('/tasks', async (c) => {
   const auth = await requireAgentAuth(c)
   if (auth.error) return auth.error
@@ -226,6 +179,113 @@ app.post('/tasks', async (c) => {
   `).bind(id, auth.user.id, type, dueAt, JSON.stringify(body.payload || {}), ts, ts).run()
 
   return c.json({ status: 'success', data: { id, type, dueAt } })
+})
+
+app.put('/wechat/proactive-state', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json()
+  const candidates = Array.isArray(body.candidates) ? body.candidates.slice(0, 500) : []
+  const ts = nowMs()
+
+  for (const item of candidates) {
+    const profileId = normalizeString(item.profileId, 120)
+    const chatId = normalizeString(item.chatId, 160)
+    const characterId = normalizeString(item.characterId, 160)
+    if (!profileId || !chatId || !characterId) continue
+
+    await c.env.DB.prepare(`
+      INSERT INTO agent_wechat_proactive_state (
+        user_id, profile_id, chat_id, character_id, proactive_chat, chat_frequency,
+        proactive_min_interval_hours, proactive_max_streak, last_message_at,
+        last_user_reply_at, last_ai_message_at, last_ai_proactive_message_at,
+        today_proactive_count, proactive_since_user_reply, is_active, is_group, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, profile_id, chat_id, character_id) DO UPDATE SET
+        proactive_chat = excluded.proactive_chat,
+        chat_frequency = excluded.chat_frequency,
+        proactive_min_interval_hours = excluded.proactive_min_interval_hours,
+        proactive_max_streak = excluded.proactive_max_streak,
+        last_message_at = excluded.last_message_at,
+        last_user_reply_at = excluded.last_user_reply_at,
+        last_ai_message_at = excluded.last_ai_message_at,
+        last_ai_proactive_message_at = excluded.last_ai_proactive_message_at,
+        today_proactive_count = excluded.today_proactive_count,
+        proactive_since_user_reply = excluded.proactive_since_user_reply,
+        is_active = excluded.is_active,
+        is_group = excluded.is_group,
+        updated_at = excluded.updated_at
+    `).bind(
+      auth.user.id,
+      profileId,
+      chatId,
+      characterId,
+      item.proactiveChat === true ? 1 : 0,
+      normalizeNumber(item.chatFrequency, 2, 0.01),
+      normalizeNumber(item.proactiveMinIntervalHours, 6, 0),
+      Math.max(1, Math.floor(normalizeNumber(item.proactiveMaxStreak, 1, 1))),
+      Math.floor(normalizeNumber(item.lastMessageAt, 0, 0)),
+      Math.floor(normalizeNumber(item.lastUserReplyAt, 0, 0)),
+      Math.floor(normalizeNumber(item.lastAiMessageAt, 0, 0)),
+      Math.floor(normalizeNumber(item.lastAiProactiveMessageAt, 0, 0)),
+      Math.max(0, Math.floor(normalizeNumber(item.todayProactiveCount, 0, 0))),
+      Math.max(0, Math.floor(normalizeNumber(item.proactiveSinceUserReply, 0, 0))),
+      item.isActive === false ? 0 : 1,
+      item.isGroup === true ? 1 : 0,
+      Math.floor(normalizeNumber(item.updatedAt, ts, 0))
+    ).run()
+  }
+
+  return c.json({ status: 'success', data: { synced: candidates.length, updatedAt: ts } })
+})
+
+app.put('/lifeline/triggers', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json()
+  const triggers = Array.isArray(body.triggers) ? body.triggers.slice(0, 500) : []
+  const ts = nowMs()
+
+  for (const item of triggers) {
+    const characterId = normalizeString(item.characterId, 160)
+    const triggerId = normalizeString(item.triggerId, 160)
+    const instruction = normalizeString(item.instruction, 520)
+    if (!characterId || !triggerId || !instruction) continue
+
+    await c.env.DB.prepare(`
+      INSERT INTO agent_lifeline_triggers (
+        user_id, character_id, trigger_id, trigger_at, intent, instruction,
+        status, visibility, participants_json, backend_only, updated_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, character_id, trigger_id) DO UPDATE SET
+        trigger_at = excluded.trigger_at,
+        intent = excluded.intent,
+        instruction = excluded.instruction,
+        status = excluded.status,
+        visibility = excluded.visibility,
+        participants_json = excluded.participants_json,
+        backend_only = excluded.backend_only,
+        updated_at = excluded.updated_at
+    `).bind(
+      auth.user.id,
+      characterId,
+      triggerId,
+      item.triggerAt ? Math.floor(normalizeNumber(item.triggerAt, 0, 0)) : null,
+      normalizeString(item.intent || 'check_in', 60),
+      instruction,
+      normalizeString(item.status || 'pending', 40),
+      normalizeString(item.visibility || 'profile', 60),
+      JSON.stringify(normalizeParticipants(item.participants)),
+      item.backendOnly === false ? 0 : 1,
+      Math.floor(normalizeNumber(item.updatedAt, ts, 0))
+    ).run()
+  }
+
+  return c.json({ status: 'success', data: { synced: triggers.length, updatedAt: ts } })
 })
 
 app.get('/outbox', async (c) => {
@@ -248,6 +308,69 @@ app.get('/outbox', async (c) => {
       payload: safeJsonParse(row.payload_json, {}),
       createdAt: Number(row.created_at || 0),
     })),
+  })
+})
+
+app.get('/events', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const encoder = new TextEncoder()
+  let lastEventId = ''
+
+  const writeEvent = (controller, event, data) => {
+    controller.enqueue(encoder.encode(`event: ${event}\n`))
+    controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`))
+  }
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      let closed = false
+
+      const poll = async () => {
+        if (closed) return
+        try {
+          const row = await c.env.DB.prepare(`
+            SELECT id, type, created_at FROM agent_outbox
+            WHERE user_id = ? AND status = 'pending'
+            ORDER BY created_at ASC
+            LIMIT 1
+          `).bind(auth.user.id).first()
+
+          if (row && row.id !== lastEventId) {
+            lastEventId = row.id
+            writeEvent(controller, 'outbox', {
+              id: row.id,
+              type: row.type,
+              createdAt: Number(row.created_at || 0),
+              now: nowMs(),
+            })
+          } else {
+            writeEvent(controller, 'heartbeat', { now: nowMs() })
+          }
+        } catch (error) {
+          writeEvent(controller, 'error', { message: error?.message || 'event poll failed' })
+        }
+      }
+
+      await poll()
+      const interval = setInterval(poll, 15000)
+      c.req.raw.signal.addEventListener('abort', () => {
+        closed = true
+        clearInterval(interval)
+        try {
+          controller.close()
+        } catch {}
+      })
+    },
+  })
+
+  return new Response(stream, {
+    headers: {
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+    },
   })
 })
 

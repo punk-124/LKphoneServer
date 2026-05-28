@@ -2,6 +2,9 @@ name = "lkphone-server"
 main = "index.js"
 compatibility_date = "2024-01-01"
 
+[triggers]
+crons = ["*/5 * * * *"]
+
 [vars]
 AUTH_PUBLIC_KEY_PEM = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArZe9KAIxGVBo0o6dS6gp
@@ -17,7 +20,3 @@ qwIDAQAB
 binding = "DB"
 database_name = "lkphone-db"
 migrations_dir = "migrations"
-
-[[r2_buckets]]
-binding = "BACKUPS"
-bucket_name = "lkphone-backups"

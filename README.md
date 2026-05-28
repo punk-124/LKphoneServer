@@ -1,6 +1,6 @@
 # LKphone Server
 
-Backend server for LKphone app, deployed on Cloudflare Workers with D1 database and R2 backup storage.
+Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 
 ## Features
 
@@ -8,14 +8,13 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database 
 2. **Forum Comments**: Get, add, delete, and reply to forum comments
 3. **Group Chat**: Support instant messaging between group members
 4. **Authenticated APIs**: Verify login JWTs for protected server features
-5. **R2 Backups**: Store and restore user-scoped backup objects in Cloudflare R2
+5. **Agent Hosting Foundation**: Store server-side proactive agent config, due tasks, random check-ins, and an outbox for LKphone clients
 
 ## Tech Stack
 
 - Node.js
 - Cloudflare Workers
 - Cloudflare D1 (SQLite database)
-- Cloudflare R2 (object storage)
 - Hono (lightweight web framework)
 
 ## Setup
@@ -28,14 +27,13 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database 
 2. **Configure Cloudflare**:
    - Create a Cloudflare account if you don't have one
    - The D1 database can be provisioned automatically from `wrangler.toml`
-   - The backup bucket is created by `npm run deploy` if it does not already exist
 
 3. **Apply migrations and deploy**:
    ```bash
    npm run deploy
    ```
 
-   This will ensure the R2 bucket exists, apply D1 migrations, then deploy the Worker.
+   This will apply D1 migrations first, then deploy the Worker.
 
 ## API Endpoints
 
@@ -60,18 +58,24 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database 
 ### Health Check
 - `GET /health`: Check server status
 
-### Backups
-- `GET /backups/health`: Check authenticated R2 backup access
-- `PUT /backups/object?key=...`: Upload a backup object
-- `GET /backups/object?key=...`: Download a backup object
-- `DELETE /backups/object?key=...`: Delete a backup object
+### Agent Hosting
+All agent endpoints require `Authorization: Bearer <login-jwt>`.
+
+- `GET /agent/status`: Get hosted agent status, pending task count, and pending outbox count
+- `GET /agent/config`: Get hosted agent config
+- `PUT /agent/config`: Enable/disable hosted agent and takeover scopes
+- `GET /agent/generation-config`: Get hosted generation config status; API keys are never returned
+- `PUT /agent/generation-config`: Save user-authorized AI API URL, API key, and model for offline generation
+- `POST /agent/tasks`: Create a due task, such as a lifeline reminder
+- `GET /agent/outbox`: Pull pending server-side agent actions
+- `POST /agent/outbox/:id/ack`: Mark an outbox action as consumed
+
+Cloudflare Cron (`*/5 * * * *`) checks due tasks and random check-ins, then writes actions into `agent_outbox`.
 
 ## Environment Variables
 
 - `DB`: Cloudflare D1 database binding
-- `BACKUPS`: Cloudflare R2 bucket binding
 - `AUTH_PUBLIC_KEY_PEM` or `JWT_PUBLIC_KEY_PEM`: RSA public key used to verify login JWTs
-- `LKPHONE_BACKUP_BUCKET`: Optional deploy-time bucket name override for `npm run r2:ensure`
 
 ## Local Development
 

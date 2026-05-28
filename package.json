@@ -6,8 +6,7 @@
   "scripts": {
     "dev": "wrangler dev",
     "cf-typegen": "wrangler types",
-    "r2:ensure": "node scripts/ensure-r2-bucket.mjs",
-    "deploy": "npm run r2:ensure && wrangler d1 migrations apply DB --remote && wrangler deploy"
+    "deploy": "wrangler d1 migrations apply DB --remote && wrangler deploy"
   },
   "dependencies": {
     "hono": "^4.0.0",

@@ -36,6 +36,13 @@ const normalizeInterval = (value, fallback) => {
   return Number.isFinite(parsed) && parsed >= 60_000 ? Math.floor(parsed) : fallback
 }
 
+const normalizeMinuteInterval = (value, fallbackMinutes) => {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) && parsed >= 1
+    ? Math.floor(parsed) * 60_000
+    : fallbackMinutes * 60_000
+}
+
 const pickNextCheckinAt = (minIntervalMs, maxIntervalMs, base = nowMs()) => {
   const min = Math.max(60_000, Number(minIntervalMs) || 60_000)
   const max = Math.max(min, Number(maxIntervalMs) || 3_600_000)
@@ -142,8 +149,20 @@ app.put('/config', async (c) => {
 
   const body = await c.req.json()
   const current = await readAgentConfig(c.env.DB, auth.user.id)
-  const minIntervalMs = normalizeInterval(body.minIntervalMs, current.minIntervalMs)
-  const maxIntervalMs = Math.max(minIntervalMs, normalizeInterval(body.maxIntervalMs, current.maxIntervalMs))
+  const intervalMinutes = body.pollIntervalMinutes && typeof body.pollIntervalMinutes === 'object'
+    ? body.pollIntervalMinutes
+    : null
+  const minIntervalMs = normalizeInterval(
+    body.minIntervalMs,
+    intervalMinutes ? normalizeMinuteInterval(intervalMinutes.min, Math.max(1, Math.floor(current.minIntervalMs / 60_000))) : current.minIntervalMs
+  )
+  const maxIntervalMs = Math.max(
+    minIntervalMs,
+    normalizeInterval(
+      body.maxIntervalMs,
+      intervalMinutes ? normalizeMinuteInterval(intervalMinutes.max, Math.max(1, Math.floor(current.maxIntervalMs / 60_000))) : current.maxIntervalMs
+    )
+  )
   const enabled = body.enabled === true
   const takeover = normalizeTakeover(body.takeover || current.takeover)
   const ts = nowMs()

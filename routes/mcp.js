@@ -9,11 +9,40 @@ const nowMs = () => Date.now()
 
 const normalizeString = (value, max = 260) => String(value || '').trim().slice(0, max)
 
+const safeJsonParse = (value, fallback) => {
+  try {
+    return value ? JSON.parse(value) : fallback
+  } catch {
+    return fallback
+  }
+}
+
+const normalizeHeaders = (value) => (
+  Array.isArray(value)
+    ? value
+      .map((item) => ({
+        key: normalizeString(item?.key, 120),
+        value: normalizeString(item?.value, 1000),
+      }))
+      .filter((item) => item.key && item.value)
+      .slice(0, 24)
+    : []
+)
+
+const normalizeDisabledTools = (value) => (
+  Array.isArray(value)
+    ? value.map((item) => normalizeString(item, 160)).filter(Boolean).slice(0, 500)
+    : []
+)
+
 const normalizeServer = (value) => ({
   id: normalizeString(value?.id || value?.serverId, 120) || `mcp_${nowMs()}_${crypto.randomUUID()}`,
   name: normalizeString(value?.name || 'MCP 服务', 80) || 'MCP 服务',
   url: normalizeString(value?.url, 520),
   token: normalizeString(value?.token, 1000),
+  transportType: value?.transportType === 'sse' ? 'sse' : 'streamable_http',
+  headers: normalizeHeaders(value?.headers),
+  disabledTools: normalizeDisabledTools(value?.disabledTools),
   enabled: value?.enabled !== false,
 })
 
@@ -22,6 +51,9 @@ const rowToServer = (row) => ({
   name: row.name,
   url: row.url,
   token: row.token || '',
+  transportType: row.transport_type === 'sse' ? 'sse' : 'streamable_http',
+  headers: normalizeHeaders(safeJsonParse(row.headers_json, [])),
+  disabledTools: normalizeDisabledTools(safeJsonParse(row.disabled_tools_json, [])),
   enabled: Number(row.enabled || 0) === 1,
   lastStatus: 'online',
   lastCheckedAt: Number(row.updated_at || 0) || undefined,
@@ -56,11 +88,16 @@ const parseMcpResponse = async (response) => {
   }
 }
 
-const postJsonRpc = async (server, method, params = {}, id = Date.now()) => {
+const postJsonRpc = async (server, method, params = {}, id = Date.now(), sessionId) => {
   const headers = new Headers()
   headers.set('Content-Type', 'application/json')
   headers.set('Accept', 'application/json, text/event-stream')
+  headers.set('Mcp-Protocol-Version', '2025-03-26')
   if (server.token) headers.set('Authorization', `Bearer ${server.token}`)
+  if (sessionId) headers.set('Mcp-Session-Id', sessionId)
+  for (const item of server.headers || []) {
+    if (item.key && item.value) headers.set(item.key, item.value)
+  }
 
   const response = await fetch(server.url, {
     method: 'POST',
@@ -76,11 +113,36 @@ const postJsonRpc = async (server, method, params = {}, id = Date.now()) => {
   if (!response.ok || payload?.error) {
     throw new Error(payload?.error?.message || `MCP 请求失败：${response.status}`)
   }
-  return payload?.result
+  const result = payload?.result && typeof payload.result === 'object' ? payload.result : { value: payload?.result }
+  return {
+    ...result,
+    __sessionId: response.headers.get('mcp-session-id') || response.headers.get('Mcp-Session-Id') || sessionId,
+  }
+}
+
+const notifyInitialized = async (server, sessionId) => {
+  const headers = new Headers()
+  headers.set('Content-Type', 'application/json')
+  headers.set('Accept', 'application/json, text/event-stream')
+  headers.set('Mcp-Protocol-Version', '2025-03-26')
+  if (server.token) headers.set('Authorization', `Bearer ${server.token}`)
+  if (sessionId) headers.set('Mcp-Session-Id', sessionId)
+  for (const item of server.headers || []) {
+    if (item.key && item.value) headers.set(item.key, item.value)
+  }
+  await fetch(server.url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'notifications/initialized',
+      params: {},
+    }),
+  }).catch(() => undefined)
 }
 
 const initializeServer = async (server) => {
-  await postJsonRpc(server, 'initialize', {
+  const result = await postJsonRpc(server, 'initialize', {
     protocolVersion: '2025-03-26',
     capabilities: {},
     clientInfo: {
@@ -88,11 +150,13 @@ const initializeServer = async (server) => {
       version: '1.0.0',
     },
   }, 1)
+  await notifyInitialized(server, result.__sessionId)
+  return result.__sessionId
 }
 
 const listServerTools = async (server) => {
-  await initializeServer(server)
-  const result = await postJsonRpc(server, 'tools/list', {}, 2)
+  const sessionId = await initializeServer(server)
+  const result = await postJsonRpc(server, 'tools/list', {}, 2, sessionId)
   const tools = Array.isArray(result?.tools) ? result.tools : []
   return tools
     .map((tool) => ({
@@ -129,15 +193,18 @@ app.put('/servers', async (c) => {
   for (const server of servers) {
     await c.env.DB.prepare(`
       INSERT INTO mcp_servers (
-        user_id, server_id, name, url, token, enabled, created_at, updated_at
+        user_id, server_id, name, url, token, transport_type, headers_json, disabled_tools_json, enabled, created_at, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       auth.user.id,
       server.id,
       server.name,
       server.url,
       server.token,
+      server.transportType,
+      JSON.stringify(server.headers),
+      JSON.stringify(server.disabledTools),
       server.enabled ? 1 : 0,
       ts,
       ts
@@ -160,6 +227,9 @@ app.get('/tools', async (c) => {
   const serverId = normalizeString(c.req.query('serverId'), 120)
   let servers = await readServers(c.env.DB, auth.user.id, true)
   if (serverId) servers = servers.filter((server) => server.id === serverId)
+  if (serverId && servers.length === 0) {
+    return jsonError(c, 'MCP server not found or disabled. Please save MCP settings first.', 404)
+  }
 
   const tools = []
   for (const server of servers) {
@@ -186,13 +256,16 @@ app.post('/call', async (c) => {
   const servers = await readServers(c.env.DB, auth.user.id, true)
   const server = servers.find((item) => item.id === serverId)
   if (!server) return jsonError(c, 'MCP server not found', 404)
+  if ((server.disabledTools || []).includes(tool)) {
+    return jsonError(c, 'MCP tool is disabled', 403)
+  }
 
   try {
-    await initializeServer(server)
+    const sessionId = await initializeServer(server)
     const result = await postJsonRpc(server, 'tools/call', {
       name: tool,
       arguments: body.arguments || {},
-    }, 3)
+    }, 3, sessionId)
     return c.json({ status: 'success', data: result })
   } catch (error) {
     return jsonError(c, error?.message || 'MCP tool call failed', 502)

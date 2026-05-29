@@ -5,6 +5,7 @@ import groupsRoutes from './routes/groups'
 import resourcesRoutes from './routes/resources'
 import systemRoutes from './routes/system'
 import agentRoutes from './routes/agent'
+import mcpRoutes from './routes/mcp'
 
 const app = new Hono()
 
@@ -15,6 +16,7 @@ app.route('/resources', resourcesRoutes)
 app.route('/comments', commentsRoutes)
 app.route('/groups', groupsRoutes)
 app.route('/agent', agentRoutes)
+app.route('/mcp', mcpRoutes)
 
 const makeWakePayload = ({ wakeKind, taskType, taskId, payload, scheduledAt, reason }) => ({
   wakeKind,

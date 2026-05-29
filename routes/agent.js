@@ -8,7 +8,7 @@ const app = new Hono()
 const DEFAULT_TAKEOVER = {
   proactiveWechat: true,
   lifelineTriggers: true,
-  nightlyDiary: true,
+  lifelineBehaviors: true,
   randomCheckin: true,
 }
 
@@ -26,6 +26,9 @@ const safeJsonParse = (value, fallback) => {
 const normalizeTakeover = (value = {}) => ({
   ...DEFAULT_TAKEOVER,
   ...(value && typeof value === 'object' ? value : {}),
+  proactiveWechat: true,
+  lifelineTriggers: true,
+  randomCheckin: true,
 })
 
 const normalizeInterval = (value, fallback) => {

@@ -34,7 +34,15 @@ const safeJsonParse = (value, fallback) => {
   }
 }
 
-const parseTakeover = (row) => safeJsonParse(row?.takeover_json, {})
+const parseTakeover = (row) => {
+  const parsed = safeJsonParse(row?.takeover_json, {})
+  return {
+    ...(parsed && typeof parsed === 'object' ? parsed : {}),
+    proactiveWechat: true,
+    lifelineTriggers: true,
+    randomCheckin: true,
+  }
+}
 
 const parseTimeToMinutes = (value) => {
   const text = String(value || '').trim()
@@ -165,13 +173,14 @@ const runAgentScheduler = async (env) => {
     const minIntervalMs = Math.max(60000, Number(config.min_interval_ms || 60000))
     const maxIntervalMs = Math.max(minIntervalMs, Number(config.max_interval_ms || 3600000))
     const nextCheckinAt = now + minIntervalMs + Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1))
+    const isLifelineBehavior = takeover.lifelineBehaviors === true && Math.random() < 0.35
     await insertWakeOutbox(
       env,
       config.user_id,
       makeWakePayload({
-        wakeKind: 'wechat',
-        taskType: 'random_checkin',
-        payload: { reason: 'random_checkin' },
+        wakeKind: isLifelineBehavior ? 'lifeline_behavior' : 'wechat',
+        taskType: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin',
+        payload: { reason: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin' },
         scheduledAt: config.next_checkin_at,
       }),
       now

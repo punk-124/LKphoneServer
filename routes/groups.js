@@ -373,9 +373,11 @@ app.post('/:id/members', async (c) => {
     )
     VALUES (?, ?, 'user', ?, ?, ?, ?, ?)
   `).bind(groupId, userId, userId, userId, invitedName, invitedAvatar, ts).run()
+  let members = await readMembers(c.env.DB, groupId)
+  let notification = null
   if (!existed) {
     const actorName = auth.user.username || auth.user.id
-    const notification = await insertGroupNotification(c.env.DB, {
+    notification = await insertGroupNotification(c.env.DB, {
       groupId,
       actorUserId: auth.user.id,
       actorName,
@@ -387,11 +389,18 @@ app.post('/:id/members', async (c) => {
       type: 'group_members_changed',
       event: 'member_added',
       message: notification,
+      members,
     })
   }
   await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
 
-  return c.json({ status: 'success', data: await readMembers(c.env.DB, groupId) })
+  return c.json({
+    status: 'success',
+    data: {
+      members,
+      message: notification,
+    },
+  })
 })
 
 app.patch('/:id/members/me', async (c) => {
@@ -476,13 +485,15 @@ app.delete('/:id/members/:memberType/:memberId', async (c) => {
     metadata: { event: 'member_removed', member_type: memberType, member_id: memberId },
     ts,
   })
+  const members = await readMembers(c.env.DB, groupId)
   await broadcastToGroup(c.env, groupId, {
     type: 'group_members_changed',
     event: 'member_removed',
     message: notification,
+    members,
   })
   await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
-  return c.json({ status: 'success', data: await readMembers(c.env.DB, groupId) })
+  return c.json({ status: 'success', data: members })
 })
 
 app.post('/:id/leave', async (c) => {
@@ -514,10 +525,12 @@ app.post('/:id/leave', async (c) => {
     metadata: { event: 'member_left', member_type: 'user', member_id: auth.user.id },
     ts,
   })
+  const members = await readMembers(c.env.DB, groupId)
   await broadcastToGroup(c.env, groupId, {
     type: 'group_members_changed',
     event: 'member_left',
     message: notification,
+    members,
   })
   await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
   return c.json({ status: 'success' })
@@ -598,10 +611,12 @@ app.post('/:id/ai-members', async (c) => {
       metadata: { event: 'ai_member_added', member_type: 'ai', member_id: aiMemberId, character_id: characterId },
       ts,
     })
+    const members = await readMembers(c.env.DB, groupId)
     await broadcastToGroup(c.env, groupId, {
       type: 'group_members_changed',
       event: 'ai_member_added',
       message: notification,
+      members,
     })
   }
   await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()

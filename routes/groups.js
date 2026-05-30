@@ -88,7 +88,7 @@ const readMembers = async (db, groupId) => {
     owner_user_id: member.owner_user_id,
     username: member.username || undefined,
     display_name: member.member_type === 'user'
-      ? (member.username || member.display_name || member.member_id)
+      ? (member.display_name || member.username || member.member_id)
       : (member.display_name || member.member_id),
     avatar: member.avatar || '',
     character_id: member.character_id || undefined,
@@ -389,6 +389,36 @@ app.post('/:id/members', async (c) => {
       message: notification,
     })
   }
+  await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
+
+  return c.json({ status: 'success', data: await readMembers(c.env.DB, groupId) })
+})
+
+app.patch('/:id/members/me', async (c) => {
+  const auth = await requireGroupAuth(c)
+  if (auth.error) return auth.error
+
+  const groupId = c.req.param('id')
+  const group = await getGroupForMember(c.env.DB, groupId, auth.user.id)
+  if (!group) return jsonError(c, 'Group not found or access denied', 404)
+
+  const body = await c.req.json().catch(() => ({}))
+  const displayName = normalizeString(body.display_name || body.displayName || body.username || body.name, 120)
+  const avatar = normalizeString(body.avatar || body.avatar_url || body.avatarUrl, 5000)
+  if (!displayName && !avatar) return c.json({ status: 'success', data: await readMembers(c.env.DB, groupId) })
+
+  await ensureUserExists(c.env.DB, auth.user.id, displayName || auth.user.username || auth.user.id)
+  const ts = nowMs()
+  await c.env.DB.prepare(`
+    UPDATE group_members
+    SET
+      display_name = COALESCE(NULLIF(?, ''), display_name),
+      avatar = COALESCE(NULLIF(?, ''), avatar),
+      updated_at = ?
+    WHERE group_id = ?
+      AND member_type = 'user'
+      AND member_id = ?
+  `).bind(displayName, avatar, ts, groupId, auth.user.id).run()
   await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
 
   return c.json({ status: 'success', data: await readMembers(c.env.DB, groupId) })

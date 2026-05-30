@@ -610,95 +610,105 @@ app.post('/:id/ai-members', async (c) => {
 })
 
 app.post('/:id/messages', async (c) => {
-  const auth = await requireGroupAuth(c)
-  if (auth.error) return auth.error
+  try {
+    const auth = await requireGroupAuth(c)
+    if (auth.error) return auth.error
 
-  const groupId = c.req.param('id')
-  const group = await getGroupForMember(c.env.DB, groupId, auth.user.id)
-  if (!group) return jsonError(c, 'Group not found or access denied', 404)
+    const groupId = c.req.param('id')
+    const group = await getGroupForMember(c.env.DB, groupId, auth.user.id)
+    if (!group) return jsonError(c, 'Group not found or access denied', 404)
 
-  const body = await c.req.json().catch(() => ({}))
-  const content = normalizeString(body.content ?? body.text, 20000)
-  if (!content) return jsonError(c, 'Missing message content')
+    const body = await c.req.json().catch(() => ({}))
+    const content = normalizeString(body.content ?? body.text, 20000)
+    if (!content) return jsonError(c, 'Missing message content')
 
-  const senderType = normalizeString(body.sender_type || body.senderType || 'user', 20)
-  const messageType = normalizeString(body.message_type || body.messageType || 'text', 40) || 'text'
-  const clientMessageId = normalizeString(body.client_message_id || body.clientMessageId, 160) || null
-  const metadata = body.metadata && typeof body.metadata === 'object' ? body.metadata : null
-  const ts = nowMs()
+    const senderType = normalizeString(body.sender_type || body.senderType || 'user', 20)
+    const messageType = normalizeString(body.message_type || body.messageType || 'text', 40) || 'text'
+    const clientMessageId = normalizeString(body.client_message_id || body.clientMessageId, 160) || null
+    const metadata = body.metadata && typeof body.metadata === 'object' ? body.metadata : null
+    const metadataJson = metadata ? JSON.stringify(metadata) : null
+    const ts = nowMs()
 
-  let senderId = auth.user.id
-  let senderName = auth.user.username || auth.user.id
+    let senderId = auth.user.id
+    let senderName = auth.user.username || auth.user.id
 
-  if (senderType === 'ai') {
-    senderId = normalizeString(body.sender_id || body.senderId, 220)
-    if (!senderId) return jsonError(c, 'Missing AI sender_id')
+    if (senderType === 'ai') {
+      senderId = normalizeString(body.sender_id || body.senderId, 220)
+      if (!senderId) return jsonError(c, 'Missing AI sender_id')
 
-    const aiMember = await c.env.DB.prepare(`
-      SELECT *
-      FROM group_members
-      WHERE group_id = ?
-        AND member_type = 'ai'
-        AND member_id = ?
-      LIMIT 1
-    `).bind(groupId, senderId).first()
+      const aiMember = await c.env.DB.prepare(`
+        SELECT *
+        FROM group_members
+        WHERE group_id = ?
+          AND member_type = 'ai'
+          AND member_id = ?
+        LIMIT 1
+      `).bind(groupId, senderId).first()
 
-    if (!aiMember) return jsonError(c, 'AI member is not in this group', 403)
-    if (aiMember.owner_user_id !== auth.user.id) {
-      return jsonError(c, 'Cannot send as another user owned AI member', 403)
+      if (!aiMember) return jsonError(c, 'AI member is not in this group', 403)
+      if (aiMember.owner_user_id !== auth.user.id) {
+        return jsonError(c, 'Cannot send as another user owned AI member', 403)
+      }
+      senderName = normalizeString(body.sender_name || body.senderName || aiMember.display_name, 120)
+    } else if (senderType !== 'user') {
+      return jsonError(c, 'Unsupported sender_type')
     }
-    senderName = normalizeString(body.sender_name || body.senderName || aiMember.display_name, 120)
-  } else if (senderType !== 'user') {
-    return jsonError(c, 'Unsupported sender_type')
-  }
 
-  if (senderType === 'user') {
-    const ok = await isUserGroupMember(c.env.DB, groupId, auth.user.id)
-    if (!ok) return jsonError(c, 'User is not in this group', 403)
-  }
-
-  if (clientMessageId) {
-    const existing = await c.env.DB.prepare(`
-      SELECT id
-      FROM messages
-      WHERE group_id = ?
-        AND actor_user_id = ?
-        AND client_message_id = ?
-      LIMIT 1
-    `).bind(groupId, auth.user.id, clientMessageId).first()
-    if (existing) {
-      return c.json({ status: 'success', data: await readMessageById(c.env.DB, existing.id), deduped: true })
+    if (senderType === 'user') {
+      const ok = await isUserGroupMember(c.env.DB, groupId, auth.user.id)
+      if (!ok) return jsonError(c, 'User is not in this group', 403)
     }
+
+    if (clientMessageId) {
+      const existing = await c.env.DB.prepare(`
+        SELECT id
+        FROM messages
+        WHERE group_id = ?
+          AND actor_user_id = ?
+          AND client_message_id = ?
+        LIMIT 1
+      `).bind(groupId, auth.user.id, clientMessageId).first()
+      if (existing) {
+        return c.json({ status: 'success', data: await readMessageById(c.env.DB, existing.id), deduped: true })
+      }
+    }
+
+    const result = await c.env.DB.prepare(`
+      INSERT INTO messages (
+        group_id, user_id, content, sender_type, sender_id, actor_user_id,
+        sender_name, message_type, client_message_id, metadata_json, created_at_ms
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      groupId,
+      auth.user.id,
+      content,
+      senderType,
+      senderId,
+      auth.user.id,
+      senderName,
+      messageType,
+      clientMessageId,
+      metadataJson,
+      ts
+    ).run()
+
+    const messageId = result.meta?.last_row_id || result.lastInsertRowid
+    await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
+    const message = await readMessageById(c.env.DB, messageId)
+    try {
+      await broadcastToGroup(c.env, groupId, {
+        type: 'group_message',
+        message,
+      })
+    } catch (error) {
+      console.warn('group message broadcast failed', error)
+    }
+    return c.json({ status: 'success', data: message })
+  } catch (error) {
+    console.error('send group message failed', error)
+    return jsonError(c, error?.message || 'Failed to send group message', 500)
   }
-
-  const result = await c.env.DB.prepare(`
-    INSERT INTO messages (
-      group_id, user_id, content, sender_type, sender_id, actor_user_id,
-      sender_name, message_type, client_message_id, metadata_json, created_at_ms
-    )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    groupId,
-    auth.user.id,
-    content,
-    senderType,
-    senderId,
-    auth.user.id,
-    senderName,
-    messageType,
-    clientMessageId,
-    metadata ? JSON.stringify(metadata) : null,
-    ts
-  ).run()
-
-  const messageId = result.meta?.last_row_id || result.lastInsertRowid
-  await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
-  const message = await readMessageById(c.env.DB, messageId)
-  await broadcastToGroup(c.env, groupId, {
-    type: 'group_message',
-    message,
-  })
-  return c.json({ status: 'success', data: message })
 })
 
 app.get('/:id/messages', async (c) => {

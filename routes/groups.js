@@ -552,76 +552,87 @@ app.delete('/:id', async (c) => {
 })
 
 app.post('/:id/ai-members', async (c) => {
-  const auth = await requireGroupAuth(c)
-  if (auth.error) return auth.error
+  try {
+    const auth = await requireGroupAuth(c)
+    if (auth.error) return auth.error
 
-  const groupId = c.req.param('id')
-  const group = await getGroupForMember(c.env.DB, groupId, auth.user.id)
-  if (!group) return jsonError(c, 'Group not found or access denied', 404)
+    const groupId = c.req.param('id')
+    const group = await getGroupForMember(c.env.DB, groupId, auth.user.id)
+    if (!group) return jsonError(c, 'Group not found or access denied', 404)
 
-  const body = await c.req.json().catch(() => ({}))
-  const characterId = normalizeString(body.character_id || body.characterId, 180)
-  const displayName = normalizeString(body.display_name || body.displayName || body.name, 120)
-  const avatar = normalizeString(body.avatar, 5000)
-  if (!characterId || !displayName) return jsonError(c, 'Missing character_id or display_name')
+    const body = await c.req.json().catch(() => ({}))
+    const characterId = normalizeString(body.character_id || body.characterId, 180)
+    const displayName = normalizeString(body.display_name || body.displayName || body.name, 120)
+    const avatar = normalizeString(body.avatar, 5000)
+    if (!characterId || !displayName) return jsonError(c, 'Missing character_id or display_name')
 
-  const aiMemberId = normalizeString(
-    body.member_id || body.memberId || `ai_${auth.user.id}_${characterId}`,
-    220
-  )
-  const snapshot = body.snapshot && typeof body.snapshot === 'object' ? body.snapshot : {}
-  const ts = nowMs()
-  const existed = await c.env.DB.prepare(`
-    SELECT 1
-    FROM group_members
-    WHERE group_id = ? AND member_type = 'ai' AND member_id = ?
-    LIMIT 1
-  `).bind(groupId, aiMemberId).first()
-
-  await c.env.DB.prepare(`
-    INSERT INTO group_members (
-      group_id, user_id, member_type, member_id, owner_user_id,
-      display_name, avatar, character_id, ai_snapshot_json, updated_at
+    const aiMemberId = normalizeString(
+      body.member_id || body.memberId || `ai_${auth.user.id}_${characterId}`,
+      220
     )
-    VALUES (?, NULL, 'ai', ?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(group_id, member_type, member_id) DO UPDATE SET
-      owner_user_id = excluded.owner_user_id,
-      display_name = excluded.display_name,
-      avatar = excluded.avatar,
-      character_id = excluded.character_id,
-      ai_snapshot_json = excluded.ai_snapshot_json,
-      updated_at = excluded.updated_at
-  `).bind(
-    groupId,
-    aiMemberId,
-    auth.user.id,
-    displayName,
-    avatar,
-    characterId,
-    JSON.stringify(snapshot),
-    ts
-  ).run()
-  if (!existed) {
-    const actorName = auth.user.username || auth.user.id
-    const notification = await insertGroupNotification(c.env.DB, {
-      groupId,
-      actorUserId: auth.user.id,
-      actorName,
-      content: `${actorName} 添加了角色 ${displayName}`,
-      metadata: { event: 'ai_member_added', member_type: 'ai', member_id: aiMemberId, character_id: characterId },
-      ts,
-    })
-    const members = await readMembers(c.env.DB, groupId)
-    await broadcastToGroup(c.env, groupId, {
-      type: 'group_members_changed',
-      event: 'ai_member_added',
-      message: notification,
-      members,
-    })
-  }
-  await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
+    const snapshot = body.snapshot && typeof body.snapshot === 'object' ? body.snapshot : {}
+    const snapshotJson = JSON.stringify(snapshot)
+    const ts = nowMs()
+    const existed = await c.env.DB.prepare(`
+      SELECT 1
+      FROM group_members
+      WHERE group_id = ? AND member_type = 'ai' AND member_id = ?
+      LIMIT 1
+    `).bind(groupId, aiMemberId).first()
 
-  return c.json({ status: 'success', data: await readMembers(c.env.DB, groupId) })
+    await c.env.DB.prepare(`
+      INSERT INTO group_members (
+        group_id, user_id, member_type, member_id, owner_user_id,
+        display_name, avatar, character_id, ai_snapshot_json, updated_at
+      )
+      VALUES (?, NULL, 'ai', ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(group_id, member_type, member_id) DO UPDATE SET
+        owner_user_id = excluded.owner_user_id,
+        display_name = excluded.display_name,
+        avatar = excluded.avatar,
+        character_id = excluded.character_id,
+        ai_snapshot_json = excluded.ai_snapshot_json,
+        updated_at = excluded.updated_at
+    `).bind(
+      groupId,
+      aiMemberId,
+      auth.user.id,
+      displayName,
+      avatar,
+      characterId,
+      snapshotJson,
+      ts
+    ).run()
+
+    await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
+    const members = await readMembers(c.env.DB, groupId)
+    if (!existed) {
+      const actorName = auth.user.username || auth.user.id
+      const notification = await insertGroupNotification(c.env.DB, {
+        groupId,
+        actorUserId: auth.user.id,
+        actorName,
+        content: `${actorName} 添加了角色 ${displayName}`,
+        metadata: { event: 'ai_member_added', member_type: 'ai', member_id: aiMemberId, character_id: characterId },
+        ts,
+      })
+      try {
+        await broadcastToGroup(c.env, groupId, {
+          type: 'group_members_changed',
+          event: 'ai_member_added',
+          message: notification,
+          members,
+        })
+      } catch (error) {
+        console.warn('group ai member broadcast failed', error)
+      }
+    }
+
+    return c.json({ status: 'success', data: members })
+  } catch (error) {
+    console.error('add group ai member failed', error)
+    return jsonError(c, error?.message || 'Failed to add AI member', 500)
+  }
 })
 
 app.post('/:id/messages', async (c) => {

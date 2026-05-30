@@ -2,6 +2,14 @@ name = "lkphone-server"
 main = "index.js"
 compatibility_date = "2024-01-01"
 
+[[durable_objects.bindings]]
+name = "GROUP_ROOM"
+class_name = "GroupRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GroupRoom"]
+
 [triggers]
 crons = ["*/5 * * * *"]
 

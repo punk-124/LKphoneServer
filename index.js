@@ -6,6 +6,7 @@ import resourcesRoutes from './routes/resources'
 import systemRoutes from './routes/system'
 import agentRoutes from './routes/agent'
 import mcpRoutes from './routes/mcp'
+export { GroupRoom } from './group-room'
 
 const app = new Hono()
 

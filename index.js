@@ -11,6 +11,13 @@ export { GroupRoom } from './group-room'
 const app = new Hono()
 
 app.use('*', cors())
+app.onError((error, c) => {
+  console.error('Unhandled worker error', error)
+  return c.json({
+    status: 'error',
+    message: error?.message || 'Internal Server Error',
+  }, 500)
+})
 
 app.route('/', systemRoutes)
 app.route('/resources', resourcesRoutes)

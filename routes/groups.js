@@ -24,6 +24,71 @@ const parseJson = (value, fallback) => {
   }
 }
 
+const insertOrUpdateGroupMember = async (db, {
+  groupId,
+  userId,
+  memberType,
+  memberId,
+  ownerUserId,
+  displayName,
+  avatar = '',
+  characterId = '',
+  aiSnapshotJson = '',
+  updatedAt,
+}) => {
+  const existing = await db.prepare(`
+    SELECT id
+    FROM group_members
+    WHERE group_id = ? AND member_type = ? AND member_id = ?
+    ORDER BY id ASC
+    LIMIT 1
+  `).bind(groupId, memberType, memberId).first()
+
+  if (existing) {
+    await db.prepare(`
+      UPDATE group_members
+      SET user_id = ?,
+          owner_user_id = ?,
+          display_name = ?,
+          avatar = ?,
+          character_id = COALESCE(NULLIF(?, ''), character_id),
+          ai_snapshot_json = COALESCE(NULLIF(?, ''), ai_snapshot_json),
+          updated_at = ?
+      WHERE id = ?
+    `).bind(
+      userId,
+      ownerUserId,
+      displayName,
+      avatar,
+      characterId,
+      aiSnapshotJson,
+      updatedAt,
+      existing.id,
+    ).run()
+    return { existed: true, id: existing.id }
+  }
+
+  const result = await db.prepare(`
+    INSERT INTO group_members (
+      group_id, user_id, member_type, member_id, owner_user_id,
+      display_name, avatar, character_id, ai_snapshot_json, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).bind(
+    groupId,
+    userId,
+    memberType,
+    memberId,
+    ownerUserId,
+    displayName,
+    avatar,
+    characterId,
+    aiSnapshotJson,
+    updatedAt,
+  ).run()
+  return { existed: false, id: result.meta?.last_row_id || result.lastInsertRowid }
+}
+
 const requireGroupAuth = async (c) => {
   await ensureGroupSchema(c.env.DB)
   const auth = await requireAuth(c)
@@ -263,10 +328,19 @@ app.get('/', async (c) => {
   `).bind(auth.user.id).all()
 
   const groups = []
+  const errors = []
   for (const group of result.results || []) {
-    groups.push(await formatGroup(c.env.DB, group))
+    try {
+      groups.push(await formatGroup(c.env.DB, group))
+    } catch (error) {
+      console.error('format group failed', { groupId: group?.id, error })
+      errors.push({
+        group_id: group?.id,
+        message: error?.message || 'Failed to read group',
+      })
+    }
   }
-  return c.json({ status: 'success', data: groups })
+  return c.json({ status: 'success', data: groups, warnings: errors })
 })
 
 app.post('/', async (c) => {
@@ -297,12 +371,16 @@ app.post('/', async (c) => {
       : (profile?.displayName || await getUserDisplayName(c.env.DB, userId))
     const userAvatar = profile?.avatar || ''
     await ensureUserExists(c.env.DB, userId, userName)
-    await c.env.DB.prepare(`
-      INSERT OR IGNORE INTO group_members (
-        group_id, user_id, member_type, member_id, owner_user_id, display_name, avatar, updated_at
-      )
-      VALUES (?, ?, 'user', ?, ?, ?, ?, ?)
-    `).bind(groupId, userId, userId, userId, userName, userAvatar, ts).run()
+    await insertOrUpdateGroupMember(c.env.DB, {
+      groupId,
+      userId,
+      memberType: 'user',
+      memberId: userId,
+      ownerUserId: userId,
+      displayName: userName,
+      avatar: userAvatar,
+      updatedAt: ts,
+    })
   }
 
   const group = await c.env.DB.prepare('SELECT * FROM groups WHERE id = ?').bind(groupId).first()
@@ -367,12 +445,16 @@ app.post('/:id/members', async (c) => {
     WHERE group_id = ? AND member_type = 'user' AND member_id = ?
     LIMIT 1
   `).bind(groupId, userId).first()
-  await c.env.DB.prepare(`
-    INSERT OR IGNORE INTO group_members (
-      group_id, user_id, member_type, member_id, owner_user_id, display_name, avatar, updated_at
-    )
-    VALUES (?, ?, 'user', ?, ?, ?, ?, ?)
-  `).bind(groupId, userId, userId, userId, invitedName, invitedAvatar, ts).run()
+  await insertOrUpdateGroupMember(c.env.DB, {
+    groupId,
+    userId,
+    memberType: 'user',
+    memberId: userId,
+    ownerUserId: userId,
+    displayName: invitedName,
+    avatar: invitedAvatar,
+    updatedAt: ts,
+  })
   let members = await readMembers(c.env.DB, groupId)
   let notification = null
   if (!existed) {
@@ -580,30 +662,18 @@ app.post('/:id/ai-members', async (c) => {
       LIMIT 1
     `).bind(groupId, aiMemberId).first()
 
-    await c.env.DB.prepare(`
-      INSERT INTO group_members (
-        group_id, user_id, member_type, member_id, owner_user_id,
-        display_name, avatar, character_id, ai_snapshot_json, updated_at
-      )
-      VALUES (?, ?, 'ai', ?, ?, ?, ?, ?, ?, ?)
-      ON CONFLICT(group_id, member_type, member_id) DO UPDATE SET
-        owner_user_id = excluded.owner_user_id,
-        display_name = excluded.display_name,
-        avatar = excluded.avatar,
-        character_id = excluded.character_id,
-        ai_snapshot_json = excluded.ai_snapshot_json,
-        updated_at = excluded.updated_at
-    `).bind(
+    await insertOrUpdateGroupMember(c.env.DB, {
       groupId,
-      auth.user.id,
-      aiMemberId,
-      auth.user.id,
+      userId: auth.user.id,
+      memberType: 'ai',
+      memberId: aiMemberId,
+      ownerUserId: auth.user.id,
       displayName,
       avatar,
       characterId,
-      snapshotJson,
-      ts
-    ).run()
+      aiSnapshotJson: snapshotJson,
+      updatedAt: ts,
+    })
 
     await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()
     const members = await readMembers(c.env.DB, groupId)
@@ -696,6 +766,26 @@ app.post('/:id/messages', async (c) => {
         LIMIT 1
       `).bind(groupId, auth.user.id, clientMessageId).first()
       if (existing) {
+        await c.env.DB.prepare(`
+          UPDATE messages
+          SET content = ?,
+              sender_type = ?,
+              sender_id = ?,
+              sender_name = ?,
+              message_type = ?,
+              metadata_json = COALESCE(?, metadata_json),
+              created_at_ms = COALESCE(created_at_ms, ?)
+          WHERE id = ?
+        `).bind(
+          content,
+          senderType,
+          senderId,
+          senderName,
+          messageType,
+          metadataJson,
+          ts,
+          existing.id
+        ).run()
         return c.json({ status: 'success', data: await readMessageById(c.env.DB, existing.id), deduped: true })
       }
     }
@@ -733,6 +823,26 @@ app.post('/:id/messages', async (c) => {
           LIMIT 1
         `).bind(groupId, auth.user.id, clientMessageId).first()
         if (existing) {
+          await c.env.DB.prepare(`
+            UPDATE messages
+            SET content = ?,
+                sender_type = ?,
+                sender_id = ?,
+                sender_name = ?,
+                message_type = ?,
+                metadata_json = COALESCE(?, metadata_json),
+                created_at_ms = COALESCE(created_at_ms, ?)
+            WHERE id = ?
+          `).bind(
+            content,
+            senderType,
+            senderId,
+            senderName,
+            messageType,
+            metadataJson,
+            ts,
+            existing.id
+          ).run()
           return c.json({ status: 'success', data: await readMessageById(c.env.DB, existing.id), deduped: true })
         }
       }

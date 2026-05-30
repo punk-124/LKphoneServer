@@ -17,9 +17,6 @@ SET member_type = COALESCE(member_type, 'user'),
     owner_user_id = COALESCE(owner_user_id, user_id),
     updated_at = COALESCE(updated_at, unixepoch() * 1000);
 
-CREATE UNIQUE INDEX IF NOT EXISTS idx_group_members_unique_member
-ON group_members (group_id, member_type, member_id);
-
 CREATE INDEX IF NOT EXISTS idx_group_members_owner
 ON group_members (owner_user_id, group_id);
 
@@ -41,7 +38,3 @@ SET sender_type = COALESCE(sender_type, 'user'),
 
 CREATE INDEX IF NOT EXISTS idx_messages_group_id
 ON messages (group_id, id);
-
-CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_dedupe
-ON messages (group_id, actor_user_id, client_message_id)
-WHERE client_message_id IS NOT NULL;

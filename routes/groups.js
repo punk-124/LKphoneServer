@@ -585,7 +585,7 @@ app.post('/:id/ai-members', async (c) => {
         group_id, user_id, member_type, member_id, owner_user_id,
         display_name, avatar, character_id, ai_snapshot_json, updated_at
       )
-      VALUES (?, NULL, 'ai', ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, 'ai', ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(group_id, member_type, member_id) DO UPDATE SET
         owner_user_id = excluded.owner_user_id,
         display_name = excluded.display_name,
@@ -595,6 +595,7 @@ app.post('/:id/ai-members', async (c) => {
         updated_at = excluded.updated_at
     `).bind(
       groupId,
+      auth.user.id,
       aiMemberId,
       auth.user.id,
       displayName,

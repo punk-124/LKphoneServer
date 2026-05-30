@@ -86,7 +86,10 @@ const readMembers = async (db, groupId) => {
     member_id: member.member_id,
     user_id: member.user_id || (member.member_type === 'user' ? member.member_id : undefined),
     owner_user_id: member.owner_user_id,
-    display_name: member.display_name || member.username || member.member_id,
+    username: member.username || undefined,
+    display_name: member.member_type === 'user'
+      ? (member.username || member.display_name || member.member_id)
+      : (member.display_name || member.member_id),
     avatar: member.avatar || '',
     character_id: member.character_id || undefined,
     ai_snapshot: parseJson(member.ai_snapshot_json, null),
@@ -172,6 +175,29 @@ const getUserDisplayName = async (db, userId) => {
   return row?.username || userId
 }
 
+const readUserMemberProfiles = (body) => {
+  const source = Array.isArray(body.user_member_profiles)
+    ? body.user_member_profiles
+    : Array.isArray(body.userMemberProfiles)
+      ? body.userMemberProfiles
+      : []
+  const profiles = new Map()
+  for (const item of source) {
+    const userId = normalizeString(item?.user_id || item?.userId || item?.id, 160)
+    if (!userId) continue
+    const displayName = normalizeString(
+      item?.display_name || item?.displayName || item?.username || item?.name || userId,
+      120
+    )
+    profiles.set(userId, {
+      userId,
+      displayName: displayName || userId,
+      avatar: normalizeString(item?.avatar || item?.avatar_url || item?.avatarUrl, 5000),
+    })
+  }
+  return profiles
+}
+
 const insertGroupNotification = async (db, { groupId, actorUserId, actorName, content, metadata = null, ts = nowMs() }) => {
   const result = await db.prepare(`
     INSERT INTO messages (
@@ -203,12 +229,12 @@ app.get('/users/search', async (c) => {
   const result = await c.env.DB.prepare(`
     SELECT user_id, username, created_at
     FROM users
-    WHERE username LIKE ?
+    WHERE username LIKE ? OR user_id LIKE ?
     ORDER BY
-      CASE WHEN username = ? THEN 0 ELSE 1 END,
+      CASE WHEN username = ? OR user_id = ? THEN 0 ELSE 1 END,
       username ASC
     LIMIT 20
-  `).bind(`%${q}%`, q).all()
+  `).bind(`%${q}%`, `%${q}%`, q, q).all()
 
   return c.json({
     status: 'success',
@@ -254,6 +280,7 @@ app.post('/', async (c) => {
   const userMemberIds = Array.isArray(body.user_member_ids)
     ? body.user_member_ids.map((id) => normalizeString(id, 160)).filter(Boolean)
     : []
+  const userMemberProfiles = readUserMemberProfiles(body)
 
   const ts = nowMs()
   const result = await c.env.DB.prepare(`
@@ -264,13 +291,18 @@ app.post('/', async (c) => {
 
   const uniqueUserIds = Array.from(new Set([auth.user.id, ...userMemberIds]))
   for (const userId of uniqueUserIds) {
-    await ensureUserExists(c.env.DB, userId, userId)
+    const profile = userMemberProfiles.get(userId)
+    const userName = userId === auth.user.id
+      ? (profile?.displayName || auth.user.username || auth.user.id)
+      : (profile?.displayName || await getUserDisplayName(c.env.DB, userId))
+    const userAvatar = profile?.avatar || ''
+    await ensureUserExists(c.env.DB, userId, userName)
     await c.env.DB.prepare(`
       INSERT OR IGNORE INTO group_members (
-        group_id, user_id, member_type, member_id, owner_user_id, display_name, updated_at
+        group_id, user_id, member_type, member_id, owner_user_id, display_name, avatar, updated_at
       )
-      VALUES (?, ?, 'user', ?, ?, ?, ?)
-    `).bind(groupId, userId, userId, userId, userId, ts).run()
+      VALUES (?, ?, 'user', ?, ?, ?, ?, ?)
+    `).bind(groupId, userId, userId, userId, userName, userAvatar, ts).run()
   }
 
   const group = await c.env.DB.prepare('SELECT * FROM groups WHERE id = ?').bind(groupId).first()
@@ -322,7 +354,12 @@ app.post('/:id/members', async (c) => {
   const userId = normalizeString(body.user_id || body.userId, 160)
   if (!userId) return jsonError(c, 'Missing user_id')
 
-  await ensureUserExists(c.env.DB, userId, userId)
+  const userMemberProfiles = readUserMemberProfiles(body)
+  const profile = userMemberProfiles.get(userId)
+  const directName = normalizeString(body.display_name || body.displayName || body.username || body.name, 120)
+  const invitedName = profile?.displayName || directName || await getUserDisplayName(c.env.DB, userId)
+  const invitedAvatar = profile?.avatar || normalizeString(body.avatar || body.avatar_url || body.avatarUrl, 5000)
+  await ensureUserExists(c.env.DB, userId, invitedName)
   const ts = nowMs()
   const existed = await c.env.DB.prepare(`
     SELECT 1
@@ -332,12 +369,11 @@ app.post('/:id/members', async (c) => {
   `).bind(groupId, userId).first()
   await c.env.DB.prepare(`
     INSERT OR IGNORE INTO group_members (
-      group_id, user_id, member_type, member_id, owner_user_id, display_name, updated_at
+      group_id, user_id, member_type, member_id, owner_user_id, display_name, avatar, updated_at
     )
-    VALUES (?, ?, 'user', ?, ?, ?, ?)
-  `).bind(groupId, userId, userId, userId, userId, ts).run()
+    VALUES (?, ?, 'user', ?, ?, ?, ?, ?)
+  `).bind(groupId, userId, userId, userId, invitedName, invitedAvatar, ts).run()
   if (!existed) {
-    const invitedName = await getUserDisplayName(c.env.DB, userId)
     const actorName = auth.user.username || auth.user.id
     const notification = await insertGroupNotification(c.env.DB, {
       groupId,

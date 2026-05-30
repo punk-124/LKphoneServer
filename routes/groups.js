@@ -700,25 +700,44 @@ app.post('/:id/messages', async (c) => {
       }
     }
 
-    const result = await c.env.DB.prepare(`
-      INSERT INTO messages (
-        group_id, user_id, content, sender_type, sender_id, actor_user_id,
-        sender_name, message_type, client_message_id, metadata_json, created_at_ms
-      )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).bind(
-      groupId,
-      auth.user.id,
-      content,
-      senderType,
-      senderId,
-      auth.user.id,
-      senderName,
-      messageType,
-      clientMessageId,
-      metadataJson,
-      ts
-    ).run()
+    let result
+    try {
+      result = await c.env.DB.prepare(`
+        INSERT INTO messages (
+          group_id, user_id, content, sender_type, sender_id, actor_user_id,
+          sender_name, message_type, client_message_id, metadata_json, created_at_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        groupId,
+        auth.user.id,
+        content,
+        senderType,
+        senderId,
+        auth.user.id,
+        senderName,
+        messageType,
+        clientMessageId,
+        metadataJson,
+        ts
+      ).run()
+    } catch (error) {
+      const message = String(error?.message || error || '')
+      if (clientMessageId && message.includes('idx_messages_client_dedupe')) {
+        const existing = await c.env.DB.prepare(`
+          SELECT id
+          FROM messages
+          WHERE group_id = ?
+            AND actor_user_id = ?
+            AND client_message_id = ?
+          LIMIT 1
+        `).bind(groupId, auth.user.id, clientMessageId).first()
+        if (existing) {
+          return c.json({ status: 'success', data: await readMessageById(c.env.DB, existing.id), deduped: true })
+        }
+      }
+      throw error
+    }
 
     const messageId = result.meta?.last_row_id || result.lastInsertRowid
     await c.env.DB.prepare('UPDATE groups SET updated_at = ? WHERE id = ?').bind(ts, groupId).run()

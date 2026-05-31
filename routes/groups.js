@@ -813,7 +813,12 @@ app.post('/:id/messages', async (c) => {
       ).run()
     } catch (error) {
       const message = String(error?.message || error || '')
-      if (clientMessageId && message.includes('idx_messages_client_dedupe')) {
+      const isClientMessageDuplicate = clientMessageId
+        && /UNIQUE constraint failed/i.test(message)
+        && message.includes('messages.group_id')
+        && message.includes('messages.actor_user_id')
+        && message.includes('messages.client_message_id')
+      if (isClientMessageDuplicate) {
         const existing = await c.env.DB.prepare(`
           SELECT id
           FROM messages

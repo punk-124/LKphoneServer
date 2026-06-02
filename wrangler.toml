@@ -27,4 +27,5 @@ qwIDAQAB
 [[d1_databases]]
 binding = "DB"
 database_name = "lkphone-db"
+database_id = "ffb13f7a-6c8f-48ad-ae54-6b18976c556b"
 migrations_dir = "migrations"

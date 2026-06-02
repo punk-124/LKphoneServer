@@ -221,17 +221,28 @@ const makeOfflineWechatDedupeKeyForSequence = (state, snapshotHash, sequence) =>
   `${makeOfflineWechatDedupeKey(state, snapshotHash)}:${Math.max(1, Math.floor(Number(sequence) || 1))}`
 
 const getPendingOfflineWechatOutbox = async (env, state, snapshotHash) => {
-  const baseKey = makeOfflineWechatDedupeKey(state, snapshotHash)
+  const baseKey = snapshotHash ? makeOfflineWechatDedupeKey(state, snapshotHash) : ''
   const result = await env.DB.prepare(`
     SELECT id, payload_json, dedupe_key, created_at
     FROM agent_outbox
     WHERE user_id = ?
       AND type = 'proactive_wechat_message'
       AND status = 'pending'
-      AND (dedupe_key = ? OR dedupe_key LIKE ?)
+      AND (
+        (? != '' AND (dedupe_key = ? OR dedupe_key LIKE ?))
+        OR json_extract(payload_json, '$.profileId') = ?
+        OR json_extract(payload_json, '$.chatId') = ?
+      )
     ORDER BY created_at ASC
     LIMIT 20
-  `).bind(state.user_id, baseKey, `${baseKey}:%`).all()
+  `).bind(
+    state.user_id,
+    baseKey,
+    baseKey,
+    `${baseKey}:%`,
+    normalizeString(state.profile_id, 120),
+    normalizeString(state.chat_id, 160)
+  ).all()
 
   return (result.results || []).map((row) => {
     const payload = safeJsonParse(row.payload_json, {})
@@ -503,7 +514,6 @@ const runAgentScheduler = async (env) => {
     const frequency = Math.max(0.01, Number(state.chat_frequency || 2))
     const minIntervalMs = Math.max(0, Number(state.proactive_min_interval_hours || 6)) * 60 * 60 * 1000
     const maxStreak = Math.max(1, Number(state.proactive_max_streak || 1))
-    const offlineMaxPending = Math.max(2, Math.min(6, Math.max(maxStreak, Math.floor(frequency))))
     const thresholdMs = (24 * 60 * 60 * 1000) / frequency
     const lastMessageAt = Number(state.last_message_at || 0)
     const lastAiMessageAt = Number(state.last_ai_message_at || 0)
@@ -541,7 +551,7 @@ const runAgentScheduler = async (env) => {
       canGenerateOffline &&
       hasLocalSnapshotAnchor &&
       snapshotHash &&
-      pendingOfflineCount < offlineMaxPending &&
+      pendingOfflineCount === 0 &&
       timeSincePendingOffline >= minIntervalMs
     ) {
       try {
@@ -630,6 +640,16 @@ const runAgentScheduler = async (env) => {
     console.log('wechat proactive dispatched', { outboxId, chatId: state.chat_id, offlineGenerated })
   }
 }
+
+app.get('/agent/debug/run-scheduler', async (c) => {
+  await runAgentScheduler(c.env)
+  return c.json({ status: 'success', data: { ranAt: Date.now() } })
+})
+
+app.post('/agent/debug/run-scheduler', async (c) => {
+  await runAgentScheduler(c.env)
+  return c.json({ status: 'success', data: { ranAt: Date.now() } })
+})
 
 export default {
   fetch: app.fetch,

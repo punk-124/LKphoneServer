@@ -26,7 +26,16 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 
 2. **Configure Cloudflare**:
    - Create a Cloudflare account if you don't have one
-   - The D1 database can be provisioned automatically from `wrangler.toml`
+   - Create or select a D1 database, then put its UUID in `wrangler.toml`:
+     ```toml
+     [[d1_databases]]
+     binding = "DB"
+     database_name = "lkphone-db"
+     database_id = "your-d1-database-uuid"
+     migrations_dir = "migrations"
+     ```
+   - Make sure `AUTH_PUBLIC_KEY_PEM` or `JWT_PUBLIC_KEY_PEM` is configured. Agent endpoints need this to verify the app login token.
+   - If you want server-held AI credentials, configure the AI variables below. If you use "frontend temporary key" mode in the app, these AI variables are optional.
 
 3. **Apply migrations and deploy**:
    ```bash
@@ -34,6 +43,8 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
    ```
 
    This will apply D1 migrations first, then deploy the Worker.
+
+After deployment, the app still needs to enable backend hosting from the frontend settings page and sync WeChat proactive candidates at least once. `/health` only proves the Worker is reachable; proactive/offline generation also needs D1, Cron, auth, frontend sync, and outbox consumption.
 
 ## API Endpoints
 

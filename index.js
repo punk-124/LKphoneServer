@@ -48,9 +48,218 @@ const parseTakeover = (row) => {
   const parsed = safeJsonParse(row?.takeover_json, {})
   return {
     ...(parsed && typeof parsed === 'object' ? parsed : {}),
-    proactiveWechat: true,
-    lifelineTriggers: true,
-    randomCheckin: true,
+    proactiveWechat: parsed?.proactiveWechat === true,
+    offlineDailyShare: parsed?.offlineDailyShare === true,
+    lifelineTriggers: parsed?.lifelineTriggers !== false,
+    lifelineBehaviors: parsed?.lifelineBehaviors !== false,
+    randomCheckin: parsed?.randomCheckin !== false,
+  }
+}
+
+const normalizeString = (value, max = 260) => String(value || '').trim().slice(0, max)
+
+const normalizeUrl = (value, max = 500) => {
+  const text = normalizeString(value, max).replace(/\/+$/, '')
+  if (!text) return ''
+  try {
+    const url = new URL(text)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return ''
+    return url.toString().replace(/\/+$/, '')
+  } catch {
+    return ''
+  }
+}
+
+const parseOfflineAi = (row) => {
+  const parsed = safeJsonParse(row?.offline_ai_json, {})
+  const source = parsed && typeof parsed === 'object' ? parsed : {}
+  return {
+    keyMode: source.keyMode === 'client_temporary' ? 'client_temporary' : 'server',
+    baseUrl: normalizeUrl(source.baseUrl),
+    model: normalizeString(source.model, 120),
+  }
+}
+
+const getServerOfflineAiCredentials = (env) => {
+  const apiKey = normalizeString(env.OFFLINE_AI_API_KEY || env.OPENAI_API_KEY || env.AI_API_KEY, 400)
+  if (!apiKey) return null
+  return {
+    apiKey,
+    baseUrl: normalizeUrl(env.OFFLINE_AI_BASE_URL || env.OPENAI_BASE_URL || 'https://api.openai.com/v1'),
+    model: normalizeString(env.OFFLINE_AI_MODEL || env.OPENAI_MODEL || 'gpt-4.1-mini', 120),
+  }
+}
+
+const getOfflineAiCredentials = async (env, state, now) => {
+  const offlineAi = parseOfflineAi(state)
+  if (offlineAi.keyMode === 'client_temporary') {
+    const row = await env.DB.prepare(`
+      SELECT api_key, base_url, model, expires_at
+      FROM agent_offline_ai_keys
+      WHERE user_id = ?
+    `).bind(state.user_id).first()
+    if (!row?.api_key) return null
+    const expiresAt = Number(row.expires_at || 0)
+    if (expiresAt > 0 && expiresAt <= now) {
+      await env.DB.prepare('DELETE FROM agent_offline_ai_keys WHERE user_id = ?').bind(state.user_id).run()
+      return null
+    }
+    return {
+      apiKey: String(row.api_key),
+      baseUrl: normalizeUrl(row.base_url || offlineAi.baseUrl),
+      model: normalizeString(row.model || offlineAi.model, 120),
+    }
+  }
+  const server = getServerOfflineAiCredentials(env)
+  if (!server) return null
+  return {
+    ...server,
+    baseUrl: offlineAi.baseUrl || server.baseUrl,
+    model: offlineAi.model || server.model,
+  }
+}
+
+const buildChatCompletionsUrl = (baseUrl) => {
+  const cleanBase = normalizeUrl(baseUrl || 'https://api.openai.com/v1')
+  if (!cleanBase) return ''
+  return cleanBase.endsWith('/chat/completions')
+    ? cleanBase
+    : `${cleanBase}/chat/completions`
+}
+
+const splitGeneratedBubbles = (text) => normalizeString(text, 2000)
+  .replace(/^```(?:\w+)?\s*/i, '')
+  .replace(/\s*```$/i, '')
+  .split(/\s*\|\|\|\s*|\n{2,}/)
+  .map((part) => part.replace(/^[-*\d.、\s]+/, '').trim())
+  .filter(Boolean)
+  .slice(0, 3)
+
+const callOfflineAi = async ({ credentials, promptPacket }) => {
+  const messages = Array.isArray(promptPacket?.messages) ? promptPacket.messages : []
+  if (messages.length === 0) return ''
+  const url = buildChatCompletionsUrl(credentials.baseUrl)
+  if (!url || !credentials.apiKey || !credentials.model) return ''
+  const options = promptPacket.options && typeof promptPacket.options === 'object' ? promptPacket.options : {}
+  const body = {
+    model: credentials.model,
+    messages,
+    temperature: Number.isFinite(Number(options.temperature)) ? Number(options.temperature) : 0.9,
+    max_tokens: Number.isFinite(Number(options.max_tokens)) ? Math.max(1, Math.floor(Number(options.max_tokens))) : 260,
+    frequency_penalty: Number.isFinite(Number(options.frequency_penalty)) ? Number(options.frequency_penalty) : undefined,
+    presence_penalty: Number.isFinite(Number(options.presence_penalty)) ? Number(options.presence_penalty) : undefined,
+  }
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${credentials.apiKey}`,
+    },
+    body: JSON.stringify(body),
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(`offline ai request failed: ${response.status} ${payload?.error?.message || ''}`.trim())
+  }
+  return String(payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || '').trim()
+}
+
+const formatElapsed = (ms) => {
+  if (!Number.isFinite(ms) || ms < 0) return '未知'
+  const minutes = Math.floor(ms / 60000)
+  if (minutes < 1) return '刚刚'
+  if (minutes < 60) return `${minutes}分钟`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}小时${minutes % 60 ? `${minutes % 60}分钟` : ''}`
+  return `${Math.floor(hours / 24)}天${hours % 24 ? `${hours % 24}小时` : ''}`
+}
+
+const insertWechatMessageOutbox = async (env, userId, payload, now) => {
+  const outboxId = `agt_out_${now}_${crypto.randomUUID()}`
+  const dedupeKey = normalizeString(payload?.dedupeKey, 260) || null
+  const result = await env.DB.prepare(`
+    INSERT OR IGNORE INTO agent_outbox (id, user_id, type, payload_json, dedupe_key, status, created_at)
+    VALUES (?, ?, 'proactive_wechat_message', ?, ?, 'pending', ?)
+  `).bind(outboxId, userId, JSON.stringify(payload), dedupeKey, now).run()
+  if (!dedupeKey) return { id: outboxId, inserted: true }
+  const inserted = Number(result?.meta?.changes || 0) > 0
+  const row = await env.DB.prepare(`
+    SELECT id FROM agent_outbox
+    WHERE dedupe_key = ? AND user_id = ?
+    LIMIT 1
+  `).bind(dedupeKey, userId).first()
+  return { id: String(row?.id || outboxId), inserted }
+}
+
+const makeOfflineWechatDedupeKey = (state, snapshotHash) => [
+  'wechat_offline_daily_share',
+  normalizeString(state.user_id, 120),
+  normalizeString(state.profile_id, 120),
+  normalizeString(state.chat_id, 160),
+  normalizeString(state.character_id, 160),
+  normalizeString(snapshotHash, 180),
+].join(':')
+
+const makeOfflineWechatDedupeKeyForSequence = (state, snapshotHash, sequence) =>
+  `${makeOfflineWechatDedupeKey(state, snapshotHash)}:${Math.max(1, Math.floor(Number(sequence) || 1))}`
+
+const getPendingOfflineWechatOutbox = async (env, state, snapshotHash) => {
+  const baseKey = makeOfflineWechatDedupeKey(state, snapshotHash)
+  const result = await env.DB.prepare(`
+    SELECT id, payload_json, dedupe_key, created_at
+    FROM agent_outbox
+    WHERE user_id = ?
+      AND type = 'proactive_wechat_message'
+      AND status = 'pending'
+      AND (dedupe_key = ? OR dedupe_key LIKE ?)
+    ORDER BY created_at ASC
+    LIMIT 20
+  `).bind(state.user_id, baseKey, `${baseKey}:%`).all()
+
+  return (result.results || []).map((row) => {
+    const payload = safeJsonParse(row.payload_json, {})
+    return {
+      id: String(row.id || ''),
+      dedupeKey: String(row.dedupe_key || ''),
+      createdAt: Number(row.created_at || 0),
+      payload,
+      sequence: Math.max(1, Math.floor(Number(payload?.offlineSequence || 0) || 1)),
+      text: normalizeString(payload?.text || '', 1200),
+    }
+  }).filter(item => item.id && item.text)
+}
+
+const withOfflineContinuationContext = (promptPacket, pendingMessages, now) => {
+  if (!Array.isArray(pendingMessages) || pendingMessages.length === 0) return promptPacket
+  const messages = Array.isArray(promptPacket?.messages) ? promptPacket.messages : []
+  const lines = pendingMessages.slice(-8).map((item, index) => {
+    const label = new Date(item.createdAt || now).toLocaleString()
+    return `${index + 1}. [${label}，距今约${formatElapsed(now - Number(item.createdAt || now))}] ${normalizeString(item.text, 360)}`
+  })
+  const continuationSystem = [
+    '### 已生成但用户尚未上线领取的离线留言',
+    '下面这些是你在同一个本地聊天快照之后，已经留给用户、但用户还没有打开 App 领取的消息。它们不是用户回复，也不是新的聊天上下文。',
+    lines.join('\n'),
+    '',
+    '继续生成时必须遵守：',
+    '- 不要回答、解释、纠正或延续上一条留言里的问题；用户还没有看到，也没有回复。',
+    '- 不要把上一条留言当作对话对象来自问自答。',
+    '- 如果还要留新消息，要表现为过了一段时间后你又想到对方，换一个更具体的生活切片或更轻的思念表达。',
+    '- 严禁复用相同开头、相同场景、相同情绪模板；如果没有新的自然内容，宁可输出空内容。',
+  ].join('\n')
+  const insertAt = Math.max(0, messages.length - 1)
+  return {
+    ...promptPacket,
+    messages: [
+      ...messages.slice(0, insertAt),
+      { role: 'system', content: continuationSystem },
+      ...messages.slice(insertAt),
+    ],
+    options: {
+      ...(promptPacket.options || {}),
+      frequency_penalty: Math.max(Number(promptPacket.options?.frequency_penalty || 0), 0.45),
+      presence_penalty: Math.max(Number(promptPacket.options?.presence_penalty || 0), 0.65),
+    },
   }
 }
 
@@ -247,11 +456,10 @@ const runAgentScheduler = async (env) => {
   }
 
   const proactiveRows = await env.DB.prepare(`
-    SELECT state.*, config.takeover_json, config.enabled
+    SELECT state.*, config.takeover_json, config.offline_ai_json, config.enabled
     FROM agent_wechat_proactive_state state
     JOIN agent_configs config ON config.user_id = state.user_id
     WHERE config.enabled = 1
-      AND state.proactive_chat = 1
       AND state.is_active = 1
       AND state.updated_at >= ?
     ORDER BY state.updated_at DESC
@@ -261,7 +469,9 @@ const runAgentScheduler = async (env) => {
   const dispatchedWechatUsers = new Set()
   for (const state of proactiveRows.results || []) {
     const takeover = parseTakeover(state)
-    if (takeover.proactiveWechat === false) continue
+    const canWakeFrontend = takeover.proactiveWechat === true && Number(state.proactive_chat || 0) === 1
+    const canGenerateOffline = takeover.offlineDailyShare === true && state.offline_prompt_packet_json
+    if (!canWakeFrontend && !canGenerateOffline) continue
     if (dispatchedWechatUsers.has(state.user_id)) continue
     if (
       isWithinClientQuietHours(
@@ -276,6 +486,7 @@ const runAgentScheduler = async (env) => {
     const frequency = Math.max(0.01, Number(state.chat_frequency || 2))
     const minIntervalMs = Math.max(0, Number(state.proactive_min_interval_hours || 6)) * 60 * 60 * 1000
     const maxStreak = Math.max(1, Number(state.proactive_max_streak || 1))
+    const offlineMaxPending = Math.max(2, Math.min(6, Math.max(maxStreak, Math.floor(frequency))))
     const thresholdMs = (24 * 60 * 60 * 1000) / frequency
     const lastMessageAt = Number(state.last_message_at || 0)
     const lastAiMessageAt = Number(state.last_ai_message_at || 0)
@@ -299,29 +510,105 @@ const runAgentScheduler = async (env) => {
       continue
     }
 
-    const outboxId = await insertWakeOutbox(
-      env,
-      state.user_id,
-      makeWakePayload({
-        wakeKind: 'wechat',
-        taskType: 'proactive_wechat_message',
-        payload: {
-          profileId: state.profile_id,
+    let outboxId = ''
+    let offlineGenerated = false
+    const snapshotHash = normalizeString(state.recent_messages_hash || state.last_local_message_id, 180)
+    const hasLocalSnapshotAnchor = Boolean(state.recent_messages_hash && state.last_local_message_id)
+    const pendingOfflineMessages = snapshotHash
+      ? await getPendingOfflineWechatOutbox(env, state, snapshotHash)
+      : []
+    const pendingOfflineCount = pendingOfflineMessages.length
+    const lastPendingOfflineAt = pendingOfflineMessages.reduce((latest, item) => Math.max(latest, Number(item.createdAt || 0)), 0)
+    const timeSincePendingOffline = lastPendingOfflineAt > 0 ? now - lastPendingOfflineAt : Number.POSITIVE_INFINITY
+    if (
+      canGenerateOffline &&
+      hasLocalSnapshotAnchor &&
+      snapshotHash &&
+      pendingOfflineCount < offlineMaxPending &&
+      timeSincePendingOffline >= minIntervalMs
+    ) {
+      try {
+        const credentials = await getOfflineAiCredentials(env, state, now)
+        const promptPacket = safeJsonParse(state.offline_prompt_packet_json, null)
+        if (credentials && promptPacket?.messages) {
+          const nextOfflineSequence = pendingOfflineCount + 1
+          const promptWithContinuation = withOfflineContinuationContext(promptPacket, pendingOfflineMessages, now)
+          const generatedText = await callOfflineAi({ credentials, promptPacket: promptWithContinuation })
+          const bubbles = splitGeneratedBubbles(generatedText)
+          const text = bubbles.join('\n')
+          if (text) {
+            const offlineDedupeKey = makeOfflineWechatDedupeKeyForSequence(state, snapshotHash, nextOfflineSequence)
+            const insertResult = await insertWechatMessageOutbox(
+              env,
+              state.user_id,
+              {
+                profileId: state.profile_id,
+                chatId: state.chat_id,
+                characterId: state.character_id,
+                senderId: state.character_id,
+                text,
+                bubbles,
+                timestamp: now,
+                reason: 'offline_daily_share',
+                aiTaskId: `offline_daily_${now}_${state.chat_id}`,
+                dedupeKey: offlineDedupeKey,
+                offlineSequence: nextOfflineSequence,
+                previousServerMessageId: pendingOfflineMessages[pendingOfflineMessages.length - 1]?.id || undefined,
+                previousServerMessageIds: pendingOfflineMessages.map(item => item.id).slice(-8),
+                baseLastLocalMessageId: state.last_local_message_id || undefined,
+                lastLocalMessageId: state.last_local_message_id || undefined,
+                baseRecentMessagesHash: state.recent_messages_hash || undefined,
+                recentMessagesHash: state.recent_messages_hash || undefined,
+              },
+              now
+            )
+            outboxId = insertResult.id
+            offlineGenerated = insertResult.inserted
+            if (insertResult.inserted) {
+              await env.DB.prepare(`
+                UPDATE agent_wechat_proactive_state
+                SET last_offline_generated_hash = ?, last_offline_generated_at = ?
+                WHERE user_id = ? AND profile_id = ? AND chat_id = ? AND character_id = ?
+              `).bind(`${snapshotHash}:${nextOfflineSequence}`, now, state.user_id, state.profile_id, state.chat_id, state.character_id).run()
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('offline daily share generation failed', {
+          userId: state.user_id,
           chatId: state.chat_id,
-          characterId: state.character_id,
-          reason: 'proactive_state_due',
-        },
-        scheduledAt: now,
-      }),
-      now
-    )
+          message: error?.message || 'unknown error',
+        })
+      }
+    }
+
+    if (!outboxId && canWakeFrontend) {
+      outboxId = await insertWakeOutbox(
+        env,
+        state.user_id,
+        makeWakePayload({
+          wakeKind: 'wechat',
+          taskType: 'proactive_wechat_message',
+          payload: {
+            profileId: state.profile_id,
+            chatId: state.chat_id,
+            characterId: state.character_id,
+            reason: 'proactive_state_due',
+          },
+          scheduledAt: now,
+        }),
+        now
+      )
+    }
+
+    if (!outboxId) continue
     await env.DB.prepare(`
       UPDATE agent_wechat_proactive_state
       SET last_dispatched_at = ?, updated_at = updated_at
       WHERE user_id = ? AND profile_id = ? AND chat_id = ? AND character_id = ?
     `).bind(now, state.user_id, state.profile_id, state.chat_id, state.character_id).run()
     dispatchedWechatUsers.add(state.user_id)
-    console.log('wechat proactive dispatched', { outboxId, chatId: state.chat_id })
+    console.log('wechat proactive dispatched', { outboxId, chatId: state.chat_id, offlineGenerated })
   }
 }
 

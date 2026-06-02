@@ -8,7 +8,7 @@ Backend server for LKphone app, deployed on Cloudflare Workers with D1 database.
 2. **Forum Comments**: Get, add, delete, and reply to forum comments
 3. **Group Chat**: Support instant messaging between group members
 4. **Authenticated APIs**: Verify login JWTs for protected server features
-5. **Agent Hosting Foundation**: Store server-side proactive agent config, due tasks, random check-ins, and an outbox for LKphone clients
+5. **Agent Hosting Foundation**: Store server-side proactive agent config, due tasks, random check-ins, offline AI generation, and an outbox for LKphone clients
 
 ## Tech Stack
 
@@ -64,18 +64,39 @@ All agent endpoints require `Authorization: Bearer <login-jwt>`.
 - `GET /agent/status`: Get hosted agent status, pending task count, and pending outbox count
 - `GET /agent/config`: Get hosted agent config
 - `PUT /agent/config`: Enable/disable hosted agent and takeover scopes
+- `POST /agent/offline-ai/temporary-key`: Authorize a client-provided OpenAI-compatible key for offline AI generation
+- `DELETE /agent/offline-ai/temporary-key`: Revoke the client-provided offline AI key
 - `PUT /agent/wechat/proactive-state`: Upsert lightweight WeChat proactive chat candidates from the client
 - `PUT /agent/lifeline/triggers`: Upsert lightweight lifeline trigger schedules from the client
 - `POST /agent/tasks`: Create a due task, such as a lifeline reminder
 - `GET /agent/outbox`: Pull pending server-side agent actions
 - `POST /agent/outbox/:id/ack`: Mark an outbox action as consumed
 
-Cloudflare Cron (`*/5 * * * *`) checks due tasks, synced lifeline triggers, synced WeChat proactive candidates, and random check-ins, then writes `wake_request` actions into `agent_outbox`.
+Cloudflare Cron (`*/5 * * * *`) checks due tasks, synced lifeline triggers, synced WeChat proactive candidates, and random check-ins. WeChat proactive candidates can either write a `wake_request` for the app frontend or, when offline daily-share generation is authorized, call an OpenAI-compatible chat-completions API and write a generated `proactive_wechat_message` into `agent_outbox`.
 
 ## Environment Variables
 
 - `DB`: Cloudflare D1 database binding
 - `AUTH_PUBLIC_KEY_PEM` or `JWT_PUBLIC_KEY_PEM`: RSA public key used to verify login JWTs
+- `OFFLINE_AI_API_KEY` or `OPENAI_API_KEY`: Optional server-held key for offline AI generation
+- `OFFLINE_AI_BASE_URL` or `OPENAI_BASE_URL`: Optional OpenAI-compatible API base URL, defaults to `https://api.openai.com/v1`
+- `OFFLINE_AI_MODEL` or `OPENAI_MODEL`: Optional model name, defaults to `gpt-4.1-mini`
+
+### Cloudflare Dashboard AI Variables
+
+For an OpenAI-compatible relay, you can configure the server-held key without editing files:
+
+1. Open Cloudflare Dashboard.
+2. Go to `Workers & Pages` -> `lkphone-server` -> `Settings` -> `Variables`.
+3. Add these variables:
+
+| Name | Type | Example |
+| --- | --- | --- |
+| `OFFLINE_AI_BASE_URL` | Plaintext variable | `https://your-relay.example.com/v1` |
+| `OFFLINE_AI_MODEL` | Plaintext variable | `gpt-4o-mini` |
+| `OFFLINE_AI_API_KEY` | Secret / encrypted variable | Your relay API key |
+
+Use `OFFLINE_AI_API_KEY` as a secret/encrypted variable, not a plaintext variable. If the app uses "frontend temporary key" mode instead, users can authorize Base URL, model, key, and TTL from the app settings page, so Cloudflare AI variables are optional.
 
 ## Local Development
 

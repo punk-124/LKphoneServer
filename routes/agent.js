@@ -6,10 +6,17 @@ import { jsonError } from '../lib/http'
 const app = new Hono()
 
 const DEFAULT_TAKEOVER = {
-  proactiveWechat: true,
+  proactiveWechat: false,
+  offlineDailyShare: false,
   lifelineTriggers: true,
   lifelineBehaviors: true,
   randomCheckin: true,
+}
+
+const DEFAULT_OFFLINE_AI = {
+  keyMode: 'server',
+  baseUrl: '',
+  model: '',
 }
 
 const nowMs = () => Date.now()
@@ -26,9 +33,11 @@ const safeJsonParse = (value, fallback) => {
 const normalizeTakeover = (value = {}) => ({
   ...DEFAULT_TAKEOVER,
   ...(value && typeof value === 'object' ? value : {}),
-  proactiveWechat: true,
-  lifelineTriggers: true,
-  randomCheckin: true,
+  proactiveWechat: value?.proactiveWechat === true,
+  offlineDailyShare: value?.offlineDailyShare === true,
+  lifelineTriggers: value?.lifelineTriggers !== false,
+  randomCheckin: value?.randomCheckin !== false,
+  lifelineBehaviors: value?.lifelineBehaviors !== false,
 })
 
 const normalizeInterval = (value, fallback) => {
@@ -56,6 +65,61 @@ const normalizeNumber = (value, fallback, min = 0) => {
 
 const normalizeString = (value, max = 260) => String(value || '').trim().slice(0, max)
 
+const normalizeUrl = (value, max = 500) => {
+  const text = normalizeString(value, max).replace(/\/+$/, '')
+  if (!text) return ''
+  try {
+    const url = new URL(text)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return ''
+    return url.toString().replace(/\/+$/, '')
+  } catch {
+    return ''
+  }
+}
+
+const normalizeOfflineAi = (value = {}, fallback = DEFAULT_OFFLINE_AI) => {
+  const source = value && typeof value === 'object' ? value : {}
+  const readOptionalNumber = (key) => (
+    Object.prototype.hasOwnProperty.call(source, key)
+      ? (Number(source[key]) || undefined)
+      : (Number(fallback[key] || 0) || undefined)
+  )
+  const baseUrl = normalizeUrl(source.baseUrl || fallback.baseUrl)
+  const model = normalizeString(source.model || fallback.model, 120)
+  const keyMode = source.keyMode === 'client_temporary' ? 'client_temporary' : 'server'
+  return {
+    ...DEFAULT_OFFLINE_AI,
+    ...fallback,
+    keyMode,
+    baseUrl,
+    model,
+    temporaryKeyExpiresAt: readOptionalNumber('temporaryKeyExpiresAt'),
+    temporaryKeyAuthorizedAt: readOptionalNumber('temporaryKeyAuthorizedAt'),
+  }
+}
+
+const sanitizePromptPacket = (value) => {
+  if (!value || typeof value !== 'object') return null
+  const kind = String(value.kind || '').trim()
+  if (kind !== 'wechat_offline_daily_share' && kind !== 'wechat_proactive') return null
+  const rawMessages = Array.isArray(value.messages) ? value.messages : []
+  const messages = rawMessages.slice(0, 12).map((message) => {
+    const role = String(message?.role || '').trim()
+    if (!['system', 'user', 'assistant'].includes(role)) return null
+    const content = normalizeString(message?.content, 12000)
+    if (!content) return null
+    return { role, content }
+  }).filter(Boolean)
+  if (messages.length === 0) return null
+  const rawOptions = value.options && typeof value.options === 'object' ? value.options : {}
+  const options = {}
+  for (const key of ['temperature', 'max_tokens', 'frequency_penalty', 'presence_penalty']) {
+    const parsed = Number(rawOptions[key])
+    if (Number.isFinite(parsed)) options[key] = parsed
+  }
+  return { version: 1, kind, messages, options }
+}
+
 const normalizeTimeValue = (value) => {
   const text = normalizeString(value, 5)
   return /^([01]\d|2[0-3]):[0-5]\d$/.test(text) ? text : null
@@ -82,6 +146,7 @@ const normalizeConfigRow = (row) => {
     return {
       enabled: false,
       takeover: DEFAULT_TAKEOVER,
+      offlineAi: DEFAULT_OFFLINE_AI,
       minIntervalMs: 60_000,
       maxIntervalMs: 3_600_000,
       nextCheckinAt: null,
@@ -92,6 +157,7 @@ const normalizeConfigRow = (row) => {
   return {
     enabled: Number(row.enabled || 0) === 1,
     takeover: normalizeTakeover(safeJsonParse(row.takeover_json, DEFAULT_TAKEOVER)),
+    offlineAi: normalizeOfflineAi(safeJsonParse(row.offline_ai_json, DEFAULT_OFFLINE_AI)),
     minIntervalMs: Number(row.min_interval_ms || 60_000),
     maxIntervalMs: Number(row.max_interval_ms || 3_600_000),
     nextCheckinAt: row.next_checkin_at ? Number(row.next_checkin_at) : null,
@@ -165,6 +231,7 @@ app.put('/config', async (c) => {
   )
   const enabled = body.enabled === true
   const takeover = normalizeTakeover(body.takeover || current.takeover)
+  const offlineAi = normalizeOfflineAi(body.offlineAi || current.offlineAi, current.offlineAi)
   const ts = nowMs()
   const nextCheckinAt = enabled && takeover.randomCheckin
     ? pickNextCheckinAt(minIntervalMs, maxIntervalMs, ts)
@@ -172,13 +239,14 @@ app.put('/config', async (c) => {
 
   await c.env.DB.prepare(`
     INSERT INTO agent_configs (
-      user_id, enabled, takeover_json, min_interval_ms, max_interval_ms,
+      user_id, enabled, takeover_json, offline_ai_json, min_interval_ms, max_interval_ms,
       next_checkin_at, last_checkin_at, created_at, updated_at
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(user_id) DO UPDATE SET
       enabled = excluded.enabled,
       takeover_json = excluded.takeover_json,
+      offline_ai_json = excluded.offline_ai_json,
       min_interval_ms = excluded.min_interval_ms,
       max_interval_ms = excluded.max_interval_ms,
       next_checkin_at = excluded.next_checkin_at,
@@ -187,6 +255,7 @@ app.put('/config', async (c) => {
     auth.user.id,
     enabled ? 1 : 0,
     JSON.stringify(takeover),
+    JSON.stringify(offlineAi),
     minIntervalMs,
     maxIntervalMs,
     nextCheckinAt,
@@ -196,6 +265,87 @@ app.put('/config', async (c) => {
   ).run()
 
   return c.json({ status: 'success', data: await readAgentConfig(c.env.DB, auth.user.id) })
+})
+
+app.post('/offline-ai/temporary-key', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json()
+  const apiKey = normalizeString(body.apiKey, 400)
+  const baseUrl = normalizeUrl(body.baseUrl)
+  const model = normalizeString(body.model, 120)
+  const ttlHours = Math.floor(normalizeNumber(body.ttlHours, 24, 0))
+  if (!apiKey) return jsonError(c, 'Missing API key')
+  if (!baseUrl) return jsonError(c, 'Invalid Base URL')
+  if (!model) return jsonError(c, 'Missing model')
+  if (ttlHours > 168) return jsonError(c, 'ttlHours must be between 0 and 168')
+
+  const ts = nowMs()
+  const expiresAt = ttlHours === 0 ? null : ts + ttlHours * 60 * 60 * 1000
+  const offlineAi = normalizeOfflineAi({
+    keyMode: 'client_temporary',
+    baseUrl,
+    model,
+    temporaryKeyAuthorizedAt: ts,
+    temporaryKeyExpiresAt: expiresAt || undefined,
+  })
+
+  await c.env.DB.prepare(`
+    INSERT INTO agent_offline_ai_keys (
+      user_id, api_key, base_url, model, expires_at, authorized_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      api_key = excluded.api_key,
+      base_url = excluded.base_url,
+      model = excluded.model,
+      expires_at = excluded.expires_at,
+      authorized_at = excluded.authorized_at,
+      updated_at = excluded.updated_at
+  `).bind(auth.user.id, apiKey, baseUrl, model, expiresAt, ts, ts).run()
+
+  const current = await readAgentConfig(c.env.DB, auth.user.id)
+  await c.env.DB.prepare(`
+    INSERT INTO agent_configs (
+      user_id, enabled, takeover_json, offline_ai_json, min_interval_ms, max_interval_ms,
+      next_checkin_at, last_checkin_at, created_at, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id) DO UPDATE SET
+      offline_ai_json = excluded.offline_ai_json,
+      updated_at = excluded.updated_at
+  `).bind(
+    auth.user.id,
+    current.enabled ? 1 : 0,
+    JSON.stringify(current.takeover),
+    JSON.stringify(offlineAi),
+    current.minIntervalMs,
+    current.maxIntervalMs,
+    current.nextCheckinAt,
+    current.lastCheckinAt,
+    ts,
+    ts
+  ).run()
+
+  return c.json({ status: 'success', data: { offlineAi } })
+})
+
+app.delete('/offline-ai/temporary-key', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const ts = nowMs()
+  await c.env.DB.prepare('DELETE FROM agent_offline_ai_keys WHERE user_id = ?').bind(auth.user.id).run()
+  const current = await readAgentConfig(c.env.DB, auth.user.id)
+  const offlineAi = normalizeOfflineAi({ ...current.offlineAi, keyMode: 'server', temporaryKeyExpiresAt: undefined, temporaryKeyAuthorizedAt: undefined }, current.offlineAi)
+  await c.env.DB.prepare(`
+    UPDATE agent_configs
+    SET offline_ai_json = ?, updated_at = ?
+    WHERE user_id = ?
+  `).bind(JSON.stringify(offlineAi), ts, auth.user.id).run()
+
+  return c.json({ status: 'success', data: { offlineAi } })
 })
 
 app.post('/tasks', async (c) => {
@@ -236,11 +386,12 @@ app.put('/wechat/proactive-state', async (c) => {
       INSERT INTO agent_wechat_proactive_state (
         user_id, profile_id, chat_id, character_id, proactive_chat, chat_frequency,
         proactive_min_interval_hours, proactive_max_streak, proactive_quiet_start,
-        proactive_quiet_end, client_time_zone, client_utc_offset_minutes, last_message_at,
+        proactive_quiet_end, client_time_zone, client_utc_offset_minutes,
+        last_local_message_id, recent_messages_hash, offline_prompt_packet_json, last_message_at,
         last_user_reply_at, last_ai_message_at, last_ai_proactive_message_at,
         today_proactive_count, proactive_since_user_reply, is_active, is_group, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, profile_id, chat_id, character_id) DO UPDATE SET
         proactive_chat = excluded.proactive_chat,
         chat_frequency = excluded.chat_frequency,
@@ -250,6 +401,9 @@ app.put('/wechat/proactive-state', async (c) => {
         proactive_quiet_end = excluded.proactive_quiet_end,
         client_time_zone = excluded.client_time_zone,
         client_utc_offset_minutes = excluded.client_utc_offset_minutes,
+        last_local_message_id = excluded.last_local_message_id,
+        recent_messages_hash = excluded.recent_messages_hash,
+        offline_prompt_packet_json = excluded.offline_prompt_packet_json,
         last_message_at = excluded.last_message_at,
         last_user_reply_at = excluded.last_user_reply_at,
         last_ai_message_at = excluded.last_ai_message_at,
@@ -272,6 +426,12 @@ app.put('/wechat/proactive-state', async (c) => {
       normalizeTimeValue(item.proactiveQuietEnd),
       normalizeTimeZone(item.clientTimeZone),
       normalizeUtcOffsetMinutes(item.clientUtcOffsetMinutes),
+      normalizeString(item.lastLocalMessageId, 180) || null,
+      normalizeString(item.recentMessagesHash, 120) || null,
+      (() => {
+        const packet = sanitizePromptPacket(item.offlineDailySharePromptPacket)
+        return packet ? JSON.stringify(packet) : null
+      })(),
       Math.floor(normalizeNumber(item.lastMessageAt, 0, 0)),
       Math.floor(normalizeNumber(item.lastUserReplyAt, 0, 0)),
       Math.floor(normalizeNumber(item.lastAiMessageAt, 0, 0)),

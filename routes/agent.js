@@ -524,13 +524,29 @@ app.put('/wechat/proactive-state', async (c) => {
 
   const body = await c.req.json()
   const candidates = Array.isArray(body.candidates) ? body.candidates.slice(0, 500) : []
+  const client = body.client && typeof body.client === 'object' ? body.client : {}
+  const clientId = normalizeString(client.id || body.clientId, 120)
+  const clientKind = normalizeString(client.kind || body.clientKind, 40)
+  const clientLabel = normalizeString(client.label || body.clientLabel, 120)
   const ts = nowMs()
+  const syncedStateKeys = new Set()
+  const makeStateKey = (profileId, chatId, characterId) => `${profileId}\n${chatId}\n${characterId}`
+
+  if (clientId) {
+    await c.env.DB.prepare(`
+      UPDATE agent_wechat_proactive_state
+      SET is_active = 0, updated_at = ?
+      WHERE user_id = ?
+        AND (client_id IS NULL OR client_id != ?)
+    `).bind(ts, auth.user.id, clientId).run()
+  }
 
   for (const item of candidates) {
     const profileId = normalizeString(item.profileId, 120)
     const chatId = normalizeString(item.chatId, 160)
     const characterId = normalizeString(item.characterId, 160)
     if (!profileId || !chatId || !characterId) continue
+    syncedStateKeys.add(makeStateKey(profileId, chatId, characterId))
 
     await c.env.DB.prepare(`
       INSERT INTO agent_wechat_proactive_state (
@@ -539,9 +555,10 @@ app.put('/wechat/proactive-state', async (c) => {
         proactive_quiet_end, client_time_zone, client_utc_offset_minutes,
         last_local_message_id, recent_messages_hash, offline_prompt_packet_json, last_message_at,
         last_user_reply_at, last_ai_message_at, last_ai_proactive_message_at,
-        today_proactive_count, proactive_since_user_reply, is_active, is_group, updated_at
+        today_proactive_count, proactive_since_user_reply, is_active, is_group, client_id,
+        client_kind, client_label, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, profile_id, chat_id, character_id) DO UPDATE SET
         proactive_chat = excluded.proactive_chat,
         chat_frequency = excluded.chat_frequency,
@@ -562,6 +579,9 @@ app.put('/wechat/proactive-state', async (c) => {
         proactive_since_user_reply = excluded.proactive_since_user_reply,
         is_active = excluded.is_active,
         is_group = excluded.is_group,
+        client_id = excluded.client_id,
+        client_kind = excluded.client_kind,
+        client_label = excluded.client_label,
         updated_at = excluded.updated_at
     `).bind(
       auth.user.id,
@@ -590,11 +610,66 @@ app.put('/wechat/proactive-state', async (c) => {
       Math.max(0, Math.floor(normalizeNumber(item.proactiveSinceUserReply, 0, 0))),
       item.isActive === false ? 0 : 1,
       item.isGroup === true ? 1 : 0,
+      clientId || normalizeString(item.clientId, 120) || null,
+      clientKind || normalizeString(item.clientKind, 40) || null,
+      clientLabel || normalizeString(item.clientLabel, 120) || null,
       Math.floor(normalizeNumber(item.updatedAt, ts, 0))
     ).run()
   }
 
-  return c.json({ status: 'success', data: { synced: candidates.length, updatedAt: ts } })
+  let deactivated = 0
+  if (clientId) {
+    const activeRows = await c.env.DB.prepare(`
+      SELECT profile_id, chat_id, character_id
+      FROM agent_wechat_proactive_state
+      WHERE user_id = ? AND client_id = ? AND is_active = 1
+    `).bind(auth.user.id, clientId).all()
+
+    for (const row of activeRows.results || []) {
+      const key = makeStateKey(
+        normalizeString(row.profile_id, 120),
+        normalizeString(row.chat_id, 160),
+        normalizeString(row.character_id, 160)
+      )
+      if (syncedStateKeys.has(key)) continue
+      await c.env.DB.prepare(`
+        UPDATE agent_wechat_proactive_state
+        SET is_active = 0, proactive_chat = 0, updated_at = ?
+        WHERE user_id = ? AND profile_id = ? AND chat_id = ? AND character_id = ?
+      `).bind(ts, auth.user.id, row.profile_id, row.chat_id, row.character_id).run()
+      deactivated += 1
+    }
+  }
+
+  return c.json({ status: 'success', data: { synced: candidates.length, deactivated, clientId: clientId || null, updatedAt: ts } })
+})
+
+app.delete('/wechat/proactive-state', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const ts = nowMs()
+  const stateResult = await c.env.DB.prepare(`
+    DELETE FROM agent_wechat_proactive_state
+    WHERE user_id = ?
+  `).bind(auth.user.id).run()
+  const outboxResult = await c.env.DB.prepare(`
+    DELETE FROM agent_outbox
+    WHERE user_id = ?
+      AND type = 'proactive_wechat_message'
+      AND status = 'pending'
+  `).bind(auth.user.id).run()
+
+  return c.json({
+    status: 'success',
+    data: {
+      deletedState: Number(stateResult?.meta?.changes || 0),
+      deletedOutbox: Number(outboxResult?.meta?.changes || 0),
+      deactivated: Number(stateResult?.meta?.changes || 0),
+      skippedOutbox: Number(outboxResult?.meta?.changes || 0),
+      updatedAt: ts,
+    },
+  })
 })
 
 app.put('/lifeline/triggers', async (c) => {

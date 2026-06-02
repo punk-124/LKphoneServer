@@ -353,6 +353,38 @@ const isWithinClientQuietHours = (startValue, endValue, now, timeZone, utcOffset
   return current >= start || current < end
 }
 
+const cleanupAgentStorage = async (env, now) => {
+  const dayMs = 24 * 60 * 60 * 1000
+  await env.DB.prepare(`
+    DELETE FROM agent_outbox
+    WHERE status IN ('consumed', 'skipped')
+      AND COALESCE(consumed_at, created_at) < ?
+  `).bind(now - 2 * dayMs).run()
+
+  await env.DB.prepare(`
+    DELETE FROM agent_outbox
+    WHERE status = 'pending'
+      AND created_at < ?
+  `).bind(now - 7 * dayMs).run()
+
+  await env.DB.prepare(`
+    DELETE FROM agent_wechat_proactive_state
+    WHERE is_active = 0
+      AND updated_at < ?
+  `).bind(now - 7 * dayMs).run()
+
+  await env.DB.prepare(`
+    DELETE FROM agent_wechat_proactive_state
+    WHERE updated_at < ?
+  `).bind(now - 30 * dayMs).run()
+
+  await env.DB.prepare(`
+    DELETE FROM agent_tasks
+    WHERE status != 'pending'
+      AND updated_at < ?
+  `).bind(now - 7 * dayMs).run()
+}
+
 const insertWakeOutbox = async (env, userId, payload, now) => {
   const outboxId = `agt_out_${now}_${crypto.randomUUID()}`
   await env.DB.prepare(`
@@ -367,6 +399,7 @@ const runAgentScheduler = async (env) => {
   const { ensureAgentSchema } = await import('./lib/db')
   await ensureAgentSchema(env.DB)
   const now = Date.now()
+  await cleanupAgentStorage(env, now)
 
   const dueTasks = await env.DB.prepare(`
     SELECT * FROM agent_tasks
@@ -498,7 +531,10 @@ const runAgentScheduler = async (env) => {
   for (const state of proactiveRows.results || []) {
     const takeover = parseTakeover(state)
     const canWakeFrontend = takeover.proactiveWechat === true && Number(state.proactive_chat || 0) === 1
-    const canGenerateOffline = takeover.offlineDailyShare === true && state.offline_prompt_packet_json
+    const canGenerateOffline = takeover.offlineDailyShare === true
+      && takeover.proactiveWechat === true
+      && Number(state.proactive_chat || 0) === 1
+      && state.offline_prompt_packet_json
     if (!canWakeFrontend && !canGenerateOffline) continue
     if (dispatchedWechatUsers.has(state.user_id)) continue
     if (

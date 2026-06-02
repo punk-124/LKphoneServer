@@ -167,6 +167,7 @@ const testOfflineAiGeneration = async (credentials, modelOverride) => {
   const model = normalizeString(modelOverride || credentials.model, 120)
   const url = buildOpenAiUrl(credentials.baseUrl, '/chat/completions')
   if (!url || !credentials.apiKey || !model) throw new Error('AI Base URL、Key 或模型名不完整')
+  const startedAt = nowMs()
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -187,7 +188,23 @@ const testOfflineAiGeneration = async (credentials, modelOverride) => {
   if (!response.ok) {
     throw new Error(payload?.error?.message || `测试生成失败：${response.status}`)
   }
-  return normalizeString(payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || '', 500)
+  const text = normalizeString(payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || '', 500)
+  return {
+    text,
+    apiLog: {
+      source: 'backend-offline-ai-test',
+      method: 'POST',
+      url,
+      status: response.status,
+      ok: true,
+      durationMs: nowMs() - startedAt,
+      model,
+      responseBody: {
+        usage: payload?.usage,
+        choices: [{ message: { content: text } }],
+      },
+    },
+  }
 }
 
 const sanitizePromptPacket = (value) => {
@@ -466,13 +483,14 @@ app.post('/offline-ai/test', async (c) => {
   const body = await c.req.json().catch(() => ({}))
   try {
     const credentials = await resolveOfflineAiCredentials(c.env, auth.user.id)
-    const text = await testOfflineAiGeneration(credentials, body?.model)
+    const result = await testOfflineAiGeneration(credentials, body?.model)
     return c.json({
       status: 'success',
       data: {
         ok: true,
         model: normalizeString(body?.model || credentials.model, 120),
-        sample: text,
+        sample: result.text,
+        apiLog: result.apiLog,
       },
     })
   } catch (error) {

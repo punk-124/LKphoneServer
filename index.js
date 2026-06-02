@@ -140,6 +140,7 @@ const callOfflineAi = async ({ credentials, promptPacket }) => {
   if (messages.length === 0) return ''
   const url = buildChatCompletionsUrl(credentials.baseUrl)
   if (!url || !credentials.apiKey || !credentials.model) return ''
+  const startedAt = Date.now()
   const options = promptPacket.options && typeof promptPacket.options === 'object' ? promptPacket.options : {}
   const body = {
     model: credentials.model,
@@ -161,7 +162,23 @@ const callOfflineAi = async ({ credentials, promptPacket }) => {
   if (!response.ok) {
     throw new Error(`offline ai request failed: ${response.status} ${payload?.error?.message || ''}`.trim())
   }
-  return String(payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || '').trim()
+  const text = String(payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || '').trim()
+  return {
+    text,
+    apiLog: {
+      source: 'backend-offline-ai',
+      method: 'POST',
+      url,
+      status: response.status,
+      ok: true,
+      durationMs: Date.now() - startedAt,
+      model: credentials.model,
+      responseBody: {
+        usage: payload?.usage,
+        choices: [{ message: { content: text } }],
+      },
+    },
+  }
 }
 
 const formatElapsed = (ms) => {
@@ -533,7 +550,8 @@ const runAgentScheduler = async (env) => {
         if (credentials && promptPacket?.messages) {
           const nextOfflineSequence = pendingOfflineCount + 1
           const promptWithContinuation = withOfflineContinuationContext(promptPacket, pendingOfflineMessages, now)
-          const generatedText = await callOfflineAi({ credentials, promptPacket: promptWithContinuation })
+          const aiResult = await callOfflineAi({ credentials, promptPacket: promptWithContinuation })
+          const generatedText = aiResult?.text || ''
           const bubbles = splitGeneratedBubbles(generatedText)
           const text = bubbles.join('\n')
           if (text) {
@@ -559,6 +577,7 @@ const runAgentScheduler = async (env) => {
                 lastLocalMessageId: state.last_local_message_id || undefined,
                 baseRecentMessagesHash: state.recent_messages_hash || undefined,
                 recentMessagesHash: state.recent_messages_hash || undefined,
+                apiLog: aiResult?.apiLog,
               },
               now
             )

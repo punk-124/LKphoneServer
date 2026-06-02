@@ -98,6 +98,98 @@ const normalizeOfflineAi = (value = {}, fallback = DEFAULT_OFFLINE_AI) => {
   }
 }
 
+const buildOpenAiUrl = (baseUrl, path) => {
+  const cleanBase = normalizeUrl(baseUrl || 'https://api.openai.com/v1')
+  if (!cleanBase) return ''
+  return cleanBase.endsWith(path) ? cleanBase : `${cleanBase}${path}`
+}
+
+const getServerOfflineAiCredentials = (env) => {
+  const apiKey = normalizeString(env.OFFLINE_AI_API_KEY || env.OPENAI_API_KEY || env.AI_API_KEY, 400)
+  if (!apiKey) return null
+  return {
+    apiKey,
+    baseUrl: normalizeUrl(env.OFFLINE_AI_BASE_URL || env.OPENAI_BASE_URL || 'https://api.openai.com/v1'),
+    model: normalizeString(env.OFFLINE_AI_MODEL || env.OPENAI_MODEL || 'gpt-4.1-mini', 120),
+  }
+}
+
+const resolveOfflineAiCredentials = async (env, userId) => {
+  const current = await readAgentConfig(env.DB, userId)
+  const offlineAi = normalizeOfflineAi(current.offlineAi)
+  if (offlineAi.keyMode === 'client_temporary') {
+    const row = await env.DB.prepare(`
+      SELECT api_key, base_url, model, expires_at
+      FROM agent_offline_ai_keys
+      WHERE user_id = ?
+    `).bind(userId).first()
+    if (!row?.api_key) throw new Error('请先授权临时 API Key')
+    const expiresAt = Number(row.expires_at || 0)
+    if (expiresAt > 0 && expiresAt <= nowMs()) {
+      await env.DB.prepare('DELETE FROM agent_offline_ai_keys WHERE user_id = ?').bind(userId).run()
+      throw new Error('临时 API Key 已过期，请重新授权')
+    }
+    return {
+      apiKey: String(row.api_key),
+      baseUrl: normalizeUrl(row.base_url || offlineAi.baseUrl),
+      model: normalizeString(row.model || offlineAi.model, 120),
+      offlineAi,
+    }
+  }
+  const server = getServerOfflineAiCredentials(env)
+  if (!server?.apiKey) throw new Error('后端未配置 OFFLINE_AI_API_KEY')
+  return {
+    ...server,
+    baseUrl: offlineAi.baseUrl || server.baseUrl,
+    model: offlineAi.model || server.model,
+    offlineAi,
+  }
+}
+
+const fetchOpenAiCompatibleModels = async (credentials) => {
+  const url = buildOpenAiUrl(credentials.baseUrl, '/models')
+  if (!url || !credentials.apiKey) throw new Error('AI Base URL 或 Key 不完整')
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: { Authorization: `Bearer ${credentials.apiKey}` },
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(payload?.error?.message || `模型列表请求失败：${response.status}`)
+  }
+  return (Array.isArray(payload?.data) ? payload.data : [])
+    .map((item) => normalizeString(item?.id || item?.name || item, 160))
+    .filter(Boolean)
+    .slice(0, 200)
+}
+
+const testOfflineAiGeneration = async (credentials, modelOverride) => {
+  const model = normalizeString(modelOverride || credentials.model, 120)
+  const url = buildOpenAiUrl(credentials.baseUrl, '/chat/completions')
+  if (!url || !credentials.apiKey || !model) throw new Error('AI Base URL、Key 或模型名不完整')
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${credentials.apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        { role: 'system', content: '你是 LuckyPhone 后端离线生成配置测试器。' },
+        { role: 'user', content: '请用一句很短的中文回复：后端离线生成可用。' },
+      ],
+      temperature: 0.2,
+      max_tokens: 40,
+    }),
+  })
+  const payload = await response.json().catch(() => null)
+  if (!response.ok) {
+    throw new Error(payload?.error?.message || `测试生成失败：${response.status}`)
+  }
+  return normalizeString(payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || '', 500)
+}
+
 const sanitizePromptPacket = (value) => {
   if (!value || typeof value !== 'object') return null
   const kind = String(value.kind || '').trim()
@@ -278,7 +370,6 @@ app.post('/offline-ai/temporary-key', async (c) => {
   const ttlHours = Math.floor(normalizeNumber(body.ttlHours, 24, 0))
   if (!apiKey) return jsonError(c, 'Missing API key')
   if (!baseUrl) return jsonError(c, 'Invalid Base URL')
-  if (!model) return jsonError(c, 'Missing model')
   if (ttlHours > 168) return jsonError(c, 'ttlHours must be between 0 and 168')
 
   const ts = nowMs()
@@ -346,6 +437,47 @@ app.delete('/offline-ai/temporary-key', async (c) => {
   `).bind(JSON.stringify(offlineAi), ts, auth.user.id).run()
 
   return c.json({ status: 'success', data: { offlineAi } })
+})
+
+app.get('/offline-ai/models', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  try {
+    const credentials = await resolveOfflineAiCredentials(c.env, auth.user.id)
+    const models = await fetchOpenAiCompatibleModels(credentials)
+    return c.json({
+      status: 'success',
+      data: {
+        models,
+        baseUrl: credentials.baseUrl,
+        model: credentials.model,
+      },
+    })
+  } catch (error) {
+    return jsonError(c, error?.message || '拉取模型失败')
+  }
+})
+
+app.post('/offline-ai/test', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json().catch(() => ({}))
+  try {
+    const credentials = await resolveOfflineAiCredentials(c.env, auth.user.id)
+    const text = await testOfflineAiGeneration(credentials, body?.model)
+    return c.json({
+      status: 'success',
+      data: {
+        ok: true,
+        model: normalizeString(body?.model || credentials.model, 120),
+        sample: text,
+      },
+    })
+  } catch (error) {
+    return jsonError(c, error?.message || '测试生成失败')
+  }
 })
 
 app.post('/tasks', async (c) => {

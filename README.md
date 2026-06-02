@@ -66,6 +66,8 @@ All agent endpoints require `Authorization: Bearer <login-jwt>`.
 - `PUT /agent/config`: Enable/disable hosted agent and takeover scopes
 - `POST /agent/offline-ai/temporary-key`: Authorize a client-provided OpenAI-compatible key for offline AI generation
 - `DELETE /agent/offline-ai/temporary-key`: Revoke the client-provided offline AI key
+- `GET /agent/offline-ai/models`: Fetch models from the configured OpenAI-compatible offline AI endpoint
+- `POST /agent/offline-ai/test`: Run a short test chat-completion using the configured offline AI endpoint
 - `PUT /agent/wechat/proactive-state`: Upsert lightweight WeChat proactive chat candidates from the client
 - `PUT /agent/lifeline/triggers`: Upsert lightweight lifeline trigger schedules from the client
 - `POST /agent/tasks`: Create a due task, such as a lifeline reminder

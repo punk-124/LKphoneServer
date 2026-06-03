@@ -422,8 +422,12 @@ const runAgentScheduler = async (env) => {
   await cleanupAgentStorage(env, now)
 
   const dueTasks = await env.DB.prepare(`
-    SELECT * FROM agent_tasks
-    WHERE status = 'pending' AND due_at <= ?
+    SELECT task.*
+    FROM agent_tasks task
+    JOIN agent_configs config ON config.user_id = task.user_id
+    WHERE config.enabled = 1
+      AND task.status = 'pending'
+      AND task.due_at <= ?
     ORDER BY due_at ASC
     LIMIT 25
   `).bind(now).all()

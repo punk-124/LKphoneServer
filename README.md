@@ -82,6 +82,8 @@ All agent endpoints require `Authorization: Bearer <login-jwt>`.
 - `PUT /agent/wechat/proactive-state`: Upsert lightweight WeChat proactive chat candidates from the client
 - `PUT /agent/lifeline/triggers`: Upsert lightweight lifeline trigger schedules from the client
 - `POST /agent/tasks`: Create a due task, such as a lifeline reminder
+- `PUT /agent/devices/push-token`: Register an Android FCM token for backend wake notifications
+- `DELETE /agent/devices/push-token`: Disable a registered Android FCM token
 - `GET /agent/outbox`: Pull pending server-side agent actions
 - `POST /agent/outbox/:id/ack`: Mark an outbox action as consumed
 
@@ -94,6 +96,10 @@ Cloudflare Cron (`*/5 * * * *`) checks due tasks, synced lifeline triggers, sync
 - `OFFLINE_AI_API_KEY` or `OPENAI_API_KEY`: Optional server-held key for offline AI generation
 - `OFFLINE_AI_BASE_URL` or `OPENAI_BASE_URL`: Optional OpenAI-compatible API base URL, defaults to `https://api.openai.com/v1`
 - `OFFLINE_AI_MODEL` or `OPENAI_MODEL`: Optional model name, defaults to `gpt-4.1-mini`
+- `FIREBASE_PROJECT_ID`: Firebase project id used by FCM HTTP v1
+- `FIREBASE_CLIENT_EMAIL`: Firebase service account client email
+- `FIREBASE_PRIVATE_KEY`: Firebase service account private key. Store as a secret and keep newline escapes (`\n`) intact.
+- Alternatively, set `FIREBASE_SERVICE_ACCOUNT_JSON` as a secret containing the full Firebase service-account JSON.
 
 ### Cloudflare Dashboard AI Variables
 

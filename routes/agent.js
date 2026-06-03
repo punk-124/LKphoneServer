@@ -2,6 +2,7 @@ import { Hono } from 'hono'
 import { requireAuth } from '../lib/auth'
 import { ensureAgentSchema, ensureUserExists } from '../lib/db'
 import { jsonError } from '../lib/http'
+import { upsertPushDevice, disablePushDevice } from '../lib/push'
 
 const app = new Hono()
 
@@ -516,6 +517,34 @@ app.post('/tasks', async (c) => {
   `).bind(id, auth.user.id, type, dueAt, JSON.stringify(body.payload || {}), ts, ts).run()
 
   return c.json({ status: 'success', data: { id, type, dueAt } })
+})
+
+app.put('/devices/push-token', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json().catch(() => ({}))
+  try {
+    await upsertPushDevice(c.env.DB, auth.user.id, {
+      token: body.token,
+      platform: body.platform,
+      clientId: body.clientId,
+      label: body.label,
+      updatedAt: body.updatedAt,
+    })
+    return c.json({ status: 'success', data: { registered: true, updatedAt: nowMs() } })
+  } catch (error) {
+    return jsonError(c, error?.message || '注册推送设备失败')
+  }
+})
+
+app.delete('/devices/push-token', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json().catch(() => ({}))
+  await disablePushDevice(c.env.DB, auth.user.id, body.token)
+  return c.json({ status: 'success', data: { disabled: true, updatedAt: nowMs() } })
 })
 
 app.put('/wechat/proactive-state', async (c) => {

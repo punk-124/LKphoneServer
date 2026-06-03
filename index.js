@@ -6,6 +6,7 @@ import resourcesRoutes from './routes/resources'
 import systemRoutes from './routes/system'
 import agentRoutes from './routes/agent'
 import mcpRoutes from './routes/mcp'
+import { notifyOutboxAvailable } from './lib/push'
 export { GroupRoom } from './group-room'
 
 const app = new Hono()
@@ -208,6 +209,19 @@ const insertWechatMessageOutbox = async (env, userId, payload, now) => {
   return { id: String(row?.id || outboxId), inserted }
 }
 
+const insertWechatMessageOutboxAndNotify = async (env, userId, payload, now) => {
+  const result = await insertWechatMessageOutbox(env, userId, payload, now)
+  if (result.inserted) {
+    await notifyOutboxAvailable(env, userId, {
+      id: result.id,
+      type: 'proactive_wechat_message',
+      payload,
+      createdAt: now,
+    })
+  }
+  return result
+}
+
 const makeOfflineWechatDedupeKey = (state, snapshotHash) => [
   'wechat_offline_daily_share',
   normalizeString(state.user_id, 120),
@@ -391,6 +405,12 @@ const insertWakeOutbox = async (env, userId, payload, now) => {
     INSERT INTO agent_outbox (id, user_id, type, payload_json, status, created_at)
     VALUES (?, ?, 'wake_request', ?, 'pending', ?)
   `).bind(outboxId, userId, JSON.stringify(payload), now).run()
+  await notifyOutboxAvailable(env, userId, {
+    id: outboxId,
+    type: 'wake_request',
+    payload,
+    createdAt: now,
+  })
   return outboxId
 }
 
@@ -454,17 +474,19 @@ const runAgentScheduler = async (env) => {
     const maxIntervalMs = Math.max(minIntervalMs, Number(config.max_interval_ms || 3600000))
     const nextCheckinAt = now + minIntervalMs + Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1))
     const isLifelineBehavior = takeover.lifelineBehaviors === true && Math.random() < 0.35
-    await insertWakeOutbox(
-      env,
-      config.user_id,
-      makeWakePayload({
-        wakeKind: isLifelineBehavior ? 'lifeline_behavior' : 'wechat',
-        taskType: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin',
-        payload: { reason: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin' },
-        scheduledAt: config.next_checkin_at,
-      }),
-      now
-    )
+    if (isLifelineBehavior || takeover.offlineDailyShare !== true) {
+      await insertWakeOutbox(
+        env,
+        config.user_id,
+        makeWakePayload({
+          wakeKind: isLifelineBehavior ? 'lifeline_behavior' : 'wechat',
+          taskType: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin',
+          payload: { reason: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin' },
+          scheduledAt: config.next_checkin_at,
+        }),
+        now
+      )
+    }
     await env.DB.prepare(`
       UPDATE agent_configs
       SET last_checkin_at = ?, next_checkin_at = ?, updated_at = ?
@@ -602,7 +624,7 @@ const runAgentScheduler = async (env) => {
           const text = bubbles.join('\n')
           if (text) {
             const offlineDedupeKey = makeOfflineWechatDedupeKeyForSequence(state, snapshotHash, nextOfflineSequence)
-            const insertResult = await insertWechatMessageOutbox(
+            const insertResult = await insertWechatMessageOutboxAndNotify(
               env,
               state.user_id,
               {
@@ -647,7 +669,7 @@ const runAgentScheduler = async (env) => {
       }
     }
 
-    if (!outboxId && canWakeFrontend) {
+    if (!outboxId && canWakeFrontend && takeover.offlineDailyShare !== true) {
       outboxId = await insertWakeOutbox(
         env,
         state.user_id,

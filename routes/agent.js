@@ -669,7 +669,8 @@ app.put('/wechat/proactive-state', async (c) => {
 
     await c.env.DB.prepare(`
       INSERT INTO agent_wechat_proactive_state (
-        user_id, profile_id, chat_id, character_id, proactive_chat, chat_frequency,
+        user_id, profile_id, chat_id, character_id, character_name, chat_title, avatar_url,
+        proactive_chat, chat_frequency,
         proactive_min_interval_hours, proactive_max_streak, proactive_quiet_start,
         proactive_quiet_end, client_time_zone, client_utc_offset_minutes,
         last_local_message_id, recent_messages_hash, offline_prompt_packet_json, last_message_at,
@@ -677,8 +678,11 @@ app.put('/wechat/proactive-state', async (c) => {
         today_proactive_count, proactive_since_user_reply, is_active, is_group, client_id,
         client_kind, client_label, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, profile_id, chat_id, character_id) DO UPDATE SET
+        character_name = excluded.character_name,
+        chat_title = excluded.chat_title,
+        avatar_url = excluded.avatar_url,
         proactive_chat = excluded.proactive_chat,
         chat_frequency = excluded.chat_frequency,
         proactive_min_interval_hours = excluded.proactive_min_interval_hours,
@@ -707,6 +711,9 @@ app.put('/wechat/proactive-state', async (c) => {
       profileId,
       chatId,
       characterId,
+      normalizeString(item.characterName, 120) || null,
+      normalizeString(item.chatTitle, 160) || null,
+      normalizeString(item.avatarUrl, 600) || null,
       item.proactiveChat === true ? 1 : 0,
       normalizeNumber(item.chatFrequency, 2, 0.01),
       normalizeNumber(item.proactiveMinIntervalHours, 6, 0),

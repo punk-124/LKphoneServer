@@ -6,6 +6,8 @@ import resourcesRoutes from './routes/resources'
 import systemRoutes from './routes/system'
 import agentRoutes from './routes/agent'
 import mcpRoutes from './routes/mcp'
+import { requireAuth } from './lib/auth'
+import { ensureAgentSchema } from './lib/db'
 import { notifyOutboxAvailable } from './lib/push'
 export { GroupRoom } from './group-room'
 
@@ -138,6 +140,33 @@ const getOfflineAiCredentials = async (env, state, now) => {
     ...server,
     baseUrl: offlineAi.baseUrl || server.baseUrl,
     model: offlineAi.model || server.model,
+  }
+}
+
+const getOfflineAiCredentialStatus = async (env, state, now) => {
+  const offlineAi = parseOfflineAi(state)
+  if (offlineAi.keyMode === 'client_temporary') {
+    const row = await env.DB.prepare(`
+      SELECT api_key, base_url, model, expires_at
+      FROM agent_offline_ai_keys
+      WHERE user_id = ?
+    `).bind(state.user_id).first()
+    const expiresAt = Number(row?.expires_at || 0)
+    return {
+      keyMode: 'client_temporary',
+      hasKey: Boolean(row?.api_key && (!expiresAt || expiresAt > now)),
+      expired: Boolean(row?.api_key && expiresAt > 0 && expiresAt <= now),
+      baseUrl: normalizeUrl(row?.base_url || offlineAi.baseUrl),
+      model: normalizeString(row?.model || offlineAi.model, 120),
+    }
+  }
+  const server = getServerOfflineAiCredentials(env)
+  return {
+    keyMode: 'server',
+    hasKey: Boolean(server?.apiKey),
+    expired: false,
+    baseUrl: offlineAi.baseUrl || server?.baseUrl || '',
+    model: offlineAi.model || server?.model || '',
   }
 }
 
@@ -434,6 +463,118 @@ const cleanupAgentStorage = async (env, now) => {
   `).bind(now - 7 * dayMs).run()
 }
 
+const getWechatProactiveDiagnostics = async (env, userId, now = Date.now()) => {
+  const config = await env.DB.prepare(`
+    SELECT * FROM agent_configs WHERE user_id = ? LIMIT 1
+  `).bind(userId).first()
+  const configEnabled = Number(config?.enabled || 0) === 1
+  const takeover = parseTakeover(config || {})
+  const activeClient = await isUserClientActive(env, userId, now)
+  const rows = await env.DB.prepare(`
+    SELECT state.*, config.takeover_json, config.offline_ai_json, config.enabled
+    FROM agent_wechat_proactive_state state
+    LEFT JOIN agent_configs config ON config.user_id = state.user_id
+    WHERE state.user_id = ?
+      AND state.is_active = 1
+    ORDER BY state.updated_at DESC
+    LIMIT 50
+  `).bind(userId).all()
+
+  const items = []
+  for (const state of rows.results || []) {
+    const itemReasons = []
+    const rowTakeover = parseTakeover({
+      takeover_json: state.takeover_json || config?.takeover_json,
+    })
+    const proactiveChat = Number(state.proactive_chat || 0) === 1
+    const promptPacket = safeJsonParse(state.offline_prompt_packet_json, null)
+    const quietNow = isWithinClientQuietHours(
+      state.proactive_quiet_start,
+      state.proactive_quiet_end,
+      now,
+      state.client_time_zone,
+      state.client_utc_offset_minutes
+    )
+    const frequency = Math.max(0.01, Number(state.chat_frequency || 2))
+    const minIntervalMs = Math.max(0, Number(state.proactive_min_interval_hours || 6)) * 60 * 60 * 1000
+    const maxStreak = Math.max(1, Number(state.proactive_max_streak || 1))
+    const thresholdMs = (24 * 60 * 60 * 1000) / frequency
+    const lastMessageAt = Number(state.last_message_at || 0)
+    const lastAiMessageAt = Number(state.last_ai_message_at || 0)
+    const lastAiProactiveAt = Number(state.last_ai_proactive_message_at || 0)
+    const lastDispatchedAt = Number(state.last_dispatched_at || 0)
+    const timeSinceLastActivity = lastMessageAt > 0 ? now - lastMessageAt : Number.POSITIVE_INFINITY
+    const timeSinceAiMessage = lastAiMessageAt > 0 ? now - lastAiMessageAt : Number.POSITIVE_INFINITY
+    const timeSinceProactive = Math.min(
+      lastAiProactiveAt > 0 ? now - lastAiProactiveAt : Number.POSITIVE_INFINITY,
+      lastDispatchedAt > 0 ? now - lastDispatchedAt : Number.POSITIVE_INFINITY
+    )
+    const minAiGapMs = Math.min(15 * 60 * 1000, minIntervalMs)
+    const snapshotHash = normalizeString(state.recent_messages_hash || state.last_local_message_id, 180)
+    const hasLocalSnapshotAnchor = Boolean(state.recent_messages_hash && state.last_local_message_id)
+    const pendingOfflineMessages = snapshotHash
+      ? await getPendingOfflineWechatOutbox(env, state, snapshotHash)
+      : []
+    const lastPendingOfflineAt = pendingOfflineMessages.reduce((latest, item) => Math.max(latest, Number(item.createdAt || 0)), 0)
+    const timeSincePendingOffline = lastPendingOfflineAt > 0 ? now - lastPendingOfflineAt : Number.POSITIVE_INFINITY
+    const aiStatus = await getOfflineAiCredentialStatus(env, state, now)
+
+    if (!configEnabled) itemReasons.push('后端总开关未开启')
+    if (activeClient) itemReasons.push('前台 90 秒内仍被判定活跃')
+    if (rowTakeover.proactiveWechat !== true) itemReasons.push('微信主动唤醒未开启')
+    if (!proactiveChat) itemReasons.push('该聊天未开启主动聊天')
+    if (!state.offline_prompt_packet_json) itemReasons.push('没有离线 prompt，需开启 AI 离线生成授权并同步一次')
+    if (state.offline_prompt_packet_json && !Array.isArray(promptPacket?.messages)) itemReasons.push('离线 prompt 无效')
+    if (!hasLocalSnapshotAnchor) itemReasons.push('缺少本地最后消息锚点')
+    if (quietNow) itemReasons.push('当前在安静时段')
+    if (timeSinceLastActivity <= thresholdMs) itemReasons.push(`最近聊天未超过频率间隔，还差约 ${Math.ceil((thresholdMs - timeSinceLastActivity) / 60000)} 分钟`)
+    if (timeSinceAiMessage <= minAiGapMs) itemReasons.push(`距离上一条 AI 消息太近，还差约 ${Math.ceil((minAiGapMs - timeSinceAiMessage) / 60000)} 分钟`)
+    if (timeSinceProactive <= minIntervalMs) itemReasons.push(`距离上次主动消息太近，还差约 ${Math.ceil((minIntervalMs - timeSinceProactive) / 60000)} 分钟`)
+    if (Number(state.today_proactive_count || 0) >= frequency) itemReasons.push('今日主动消息次数已达频率上限')
+    if (Number(state.proactive_since_user_reply || 0) >= maxStreak) itemReasons.push('用户未回复前的主动连发已达上限')
+    if (pendingOfflineMessages.length > 0) itemReasons.push(`已有 ${pendingOfflineMessages.length} 条未领取离线消息`)
+    if (timeSincePendingOffline < minIntervalMs) itemReasons.push(`距离上一条未领取离线消息太近，还差约 ${Math.ceil((minIntervalMs - timeSincePendingOffline) / 60000)} 分钟`)
+    if (!aiStatus.hasKey) itemReasons.push(aiStatus.expired ? '临时 AI Key 已过期' : 'AI Key 不可用')
+    if (!aiStatus.model) itemReasons.push('AI 模型未配置')
+
+    items.push({
+      profileId: state.profile_id,
+      chatId: state.chat_id,
+      characterId: state.character_id,
+      characterName: state.character_name || state.chat_title || '',
+      ready: itemReasons.length === 0,
+      reasons: itemReasons,
+      checks: {
+        configEnabled,
+        activeClient,
+        proactiveWechat: rowTakeover.proactiveWechat === true,
+        proactiveChat,
+        hasOfflinePrompt: Boolean(state.offline_prompt_packet_json),
+        promptMessages: Array.isArray(promptPacket?.messages) ? promptPacket.messages.length : 0,
+        hasLocalSnapshotAnchor,
+        quietNow,
+        pendingOfflineCount: pendingOfflineMessages.length,
+        frequency,
+        minIntervalHours: minIntervalMs / (60 * 60 * 1000),
+        aiKeyMode: aiStatus.keyMode,
+        hasAiKey: aiStatus.hasKey,
+        aiModel: aiStatus.model,
+      },
+      updatedAt: Number(state.updated_at || 0),
+    })
+  }
+
+  return {
+    ranAt: now,
+    configEnabled,
+    takeover,
+    activeClient,
+    candidateCount: items.length,
+    readyCount: items.filter(item => item.ready).length,
+    items,
+  }
+}
+
 const insertWakeOutbox = async (env, userId, payload, now) => {
   const outboxId = `agt_out_${now}_${crypto.randomUUID()}`
   const dedupeKey = normalizeString(payload?.dedupeKey || makeWakeDedupeKey(userId, payload), 260) || null
@@ -684,6 +825,10 @@ const runAgentScheduler = async (env) => {
                 chatId: state.chat_id,
                 characterId: state.character_id,
                 senderId: state.character_id,
+                senderName: state.character_name || state.chat_title || undefined,
+                characterName: state.character_name || undefined,
+                chatTitle: state.chat_title || undefined,
+                avatarUrl: state.avatar_url || undefined,
                 text,
                 bubbles,
                 timestamp: now,
@@ -733,13 +878,27 @@ const runAgentScheduler = async (env) => {
 }
 
 app.get('/agent/debug/run-scheduler', async (c) => {
+  const auth = await requireAuth(c)
+  if (auth.error) return auth.error
+  await ensureAgentSchema(c.env.DB)
   await runAgentScheduler(c.env)
   return c.json({ status: 'success', data: { ranAt: Date.now() } })
 })
 
 app.post('/agent/debug/run-scheduler', async (c) => {
+  const auth = await requireAuth(c)
+  if (auth.error) return auth.error
+  await ensureAgentSchema(c.env.DB)
   await runAgentScheduler(c.env)
   return c.json({ status: 'success', data: { ranAt: Date.now() } })
+})
+
+app.get('/agent/debug/proactive-diagnostics', async (c) => {
+  const auth = await requireAuth(c)
+  if (auth.error) return auth.error
+  await ensureAgentSchema(c.env.DB)
+  const data = await getWechatProactiveDiagnostics(c.env, auth.user.id)
+  return c.json({ status: 'success', data })
 })
 
 export default {

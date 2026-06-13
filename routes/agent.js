@@ -547,6 +547,47 @@ app.delete('/devices/push-token', async (c) => {
   return c.json({ status: 'success', data: { disabled: true, updatedAt: nowMs() } })
 })
 
+app.put('/client-presence', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json().catch(() => ({}))
+  const client = body.client && typeof body.client === 'object' ? body.client : {}
+  const clientId = normalizeString(client.id || body.clientId, 120)
+  if (!clientId) return jsonError(c, 'Missing client id')
+
+  const ts = nowMs()
+  await c.env.DB.prepare(`
+    INSERT INTO agent_client_presence (
+      user_id, client_id, client_kind, client_label, profile_id, active_app_id,
+      wechat_chat_id, visible, foreground, updated_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(user_id, client_id) DO UPDATE SET
+      client_kind = excluded.client_kind,
+      client_label = excluded.client_label,
+      profile_id = excluded.profile_id,
+      active_app_id = excluded.active_app_id,
+      wechat_chat_id = excluded.wechat_chat_id,
+      visible = excluded.visible,
+      foreground = excluded.foreground,
+      updated_at = excluded.updated_at
+  `).bind(
+    auth.user.id,
+    clientId,
+    normalizeString(client.kind || body.clientKind, 40) || null,
+    normalizeString(client.label || body.clientLabel, 120) || null,
+    normalizeString(body.profileId, 120) || null,
+    normalizeString(body.activeAppId, 80) || null,
+    normalizeString(body.wechatChatId, 160) || null,
+    body.visible === true ? 1 : 0,
+    body.foreground === true ? 1 : 0,
+    ts
+  ).run()
+
+  return c.json({ status: 'success', data: { updatedAt: ts } })
+})
+
 app.put('/wechat/proactive-state', async (c) => {
   const auth = await requireAgentAuth(c)
   if (auth.error) return auth.error
@@ -756,7 +797,7 @@ app.get('/outbox', async (c) => {
   const result = await c.env.DB.prepare(`
     SELECT * FROM agent_outbox
     WHERE user_id = ? AND status = 'pending'
-    ORDER BY created_at ASC
+    ORDER BY created_at ASC, id ASC
     LIMIT ?
   `).bind(auth.user.id, limit).all()
 
@@ -793,7 +834,7 @@ app.get('/events', async (c) => {
           const row = await c.env.DB.prepare(`
             SELECT id, type, created_at FROM agent_outbox
             WHERE user_id = ? AND status = 'pending'
-            ORDER BY created_at ASC
+            ORDER BY created_at DESC, id DESC
             LIMIT 1
           `).bind(auth.user.id).first()
 

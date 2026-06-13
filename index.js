@@ -59,6 +59,27 @@ const parseTakeover = (row) => {
 
 const normalizeString = (value, max = 260) => String(value || '').trim().slice(0, max)
 
+const makeWakeDedupeKey = (userId, payload = {}) => {
+  const nested = payload?.payload && typeof payload.payload === 'object' ? payload.payload : {}
+  const taskType = normalizeString(payload.taskType || payload.type || 'wake', 80)
+  const wakeKind = normalizeString(payload.wakeKind || payload.kind || 'generic', 80)
+  const taskId = normalizeString(payload.taskId || nested.taskId || nested.triggerId, 160)
+  const profileId = normalizeString(payload.profileId || nested.profileId || nested.wechatProfileId, 120)
+  const chatId = normalizeString(payload.chatId || nested.chatId || nested.targetId, 160)
+  const characterId = normalizeString(payload.characterId || nested.characterId || nested.responderId, 160)
+  const snapshot = normalizeString(payload.snapshotHash || nested.snapshotHash || nested.recentMessagesHash || nested.lastLocalMessageId, 180)
+  const scheduledAt = Math.floor(Number(payload.scheduledAt || nested.scheduledAt || 0) || 0)
+  const fiveMinuteBucket = scheduledAt > 0 ? Math.floor(scheduledAt / (5 * 60 * 1000)) : 'current'
+
+  if (taskId) {
+    return ['wake', userId, taskType, taskId, scheduledAt || 'unscheduled'].map(part => normalizeString(part, 180)).join(':')
+  }
+  if (profileId || chatId || characterId) {
+    return ['wake', userId, wakeKind, taskType, profileId, chatId, characterId, snapshot || 'nosnapshot', fiveMinuteBucket].map(part => normalizeString(part, 180)).join(':')
+  }
+  return ['wake', userId, wakeKind, taskType, fiveMinuteBucket].map(part => normalizeString(part, 180)).join(':')
+}
+
 const normalizeUrl = (value, max = 500) => {
   const text = normalizeString(value, max).replace(/\/+$/, '')
   if (!text) return ''
@@ -118,6 +139,20 @@ const getOfflineAiCredentials = async (env, state, now) => {
     baseUrl: offlineAi.baseUrl || server.baseUrl,
     model: offlineAi.model || server.model,
   }
+}
+
+const isUserClientActive = async (env, userId, now) => {
+  const row = await env.DB.prepare(`
+    SELECT updated_at
+    FROM agent_client_presence
+    WHERE user_id = ?
+      AND visible = 1
+      AND foreground = 1
+      AND updated_at >= ?
+    ORDER BY updated_at DESC
+    LIMIT 1
+  `).bind(userId, now - 90_000).first()
+  return Boolean(row?.updated_at)
 }
 
 const buildChatCompletionsUrl = (baseUrl) => {
@@ -247,7 +282,7 @@ const getPendingOfflineWechatOutbox = async (env, state, snapshotHash) => {
         OR json_extract(payload_json, '$.profileId') = ?
         OR json_extract(payload_json, '$.chatId') = ?
       )
-    ORDER BY created_at ASC
+    ORDER BY created_at ASC, id ASC
     LIMIT 20
   `).bind(
     state.user_id,
@@ -401,17 +436,29 @@ const cleanupAgentStorage = async (env, now) => {
 
 const insertWakeOutbox = async (env, userId, payload, now) => {
   const outboxId = `agt_out_${now}_${crypto.randomUUID()}`
-  await env.DB.prepare(`
-    INSERT INTO agent_outbox (id, user_id, type, payload_json, status, created_at)
-    VALUES (?, ?, 'wake_request', ?, 'pending', ?)
-  `).bind(outboxId, userId, JSON.stringify(payload), now).run()
-  await notifyOutboxAvailable(env, userId, {
-    id: outboxId,
-    type: 'wake_request',
-    payload,
-    createdAt: now,
-  })
-  return outboxId
+  const dedupeKey = normalizeString(payload?.dedupeKey || makeWakeDedupeKey(userId, payload), 260) || null
+  const result = await env.DB.prepare(`
+    INSERT OR IGNORE INTO agent_outbox (id, user_id, type, payload_json, dedupe_key, status, created_at)
+    VALUES (?, ?, 'wake_request', ?, ?, 'pending', ?)
+  `).bind(outboxId, userId, JSON.stringify(payload), dedupeKey, now).run()
+  const inserted = Number(result?.meta?.changes || 0) > 0
+  const row = dedupeKey
+    ? await env.DB.prepare(`
+      SELECT id FROM agent_outbox
+      WHERE dedupe_key = ? AND user_id = ?
+      LIMIT 1
+    `).bind(dedupeKey, userId).first()
+    : null
+  const id = String(row?.id || outboxId)
+  if (inserted) {
+    await notifyOutboxAvailable(env, userId, {
+      id,
+      type: 'wake_request',
+      payload,
+      createdAt: now,
+    })
+  }
+  return id
 }
 
 const runAgentScheduler = async (env) => {
@@ -472,20 +519,21 @@ const runAgentScheduler = async (env) => {
   `).bind(now).all()
 
   for (const config of checkins.results || []) {
+    if (await isUserClientActive(env, config.user_id, now)) continue
     const takeover = parseTakeover(config)
     if (takeover.randomCheckin === false) continue
     const minIntervalMs = Math.max(60000, Number(config.min_interval_ms || 60000))
     const maxIntervalMs = Math.max(minIntervalMs, Number(config.max_interval_ms || 3600000))
     const nextCheckinAt = now + minIntervalMs + Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1))
     const isLifelineBehavior = takeover.lifelineBehaviors === true && Math.random() < 0.35
-    if (isLifelineBehavior || takeover.offlineDailyShare !== true) {
+    if (isLifelineBehavior) {
       await insertWakeOutbox(
         env,
         config.user_id,
         makeWakePayload({
-          wakeKind: isLifelineBehavior ? 'lifeline_behavior' : 'wechat',
-          taskType: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin',
-          payload: { reason: isLifelineBehavior ? 'lifeline_random_behavior' : 'random_checkin' },
+          wakeKind: 'lifeline_behavior',
+          taskType: 'lifeline_random_behavior',
+          payload: { reason: 'lifeline_random_behavior' },
           scheduledAt: config.next_checkin_at,
         }),
         now
@@ -555,6 +603,7 @@ const runAgentScheduler = async (env) => {
 
   const dispatchedWechatUsers = new Set()
   for (const state of proactiveRows.results || []) {
+    if (await isUserClientActive(env, state.user_id, now)) continue
     const takeover = parseTakeover(state)
     const canWakeFrontend = takeover.proactiveWechat === true && Number(state.proactive_chat || 0) === 1
     const canGenerateOffline = takeover.offlineDailyShare === true
@@ -671,25 +720,6 @@ const runAgentScheduler = async (env) => {
           message: error?.message || 'unknown error',
         })
       }
-    }
-
-    if (!outboxId && canWakeFrontend && takeover.offlineDailyShare !== true) {
-      outboxId = await insertWakeOutbox(
-        env,
-        state.user_id,
-        makeWakePayload({
-          wakeKind: 'wechat',
-          taskType: 'proactive_wechat_message',
-          payload: {
-            profileId: state.profile_id,
-            chatId: state.chat_id,
-            characterId: state.character_id,
-            reason: 'proactive_state_due',
-          },
-          scheduledAt: now,
-        }),
-        now
-      )
     }
 
     if (!outboxId) continue

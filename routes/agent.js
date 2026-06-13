@@ -2,7 +2,7 @@ import { Hono } from 'hono'
 import { requireAuth } from '../lib/auth'
 import { ensureAgentSchema, ensureUserExists } from '../lib/db'
 import { jsonError } from '../lib/http'
-import { upsertPushDevice, disablePushDevice } from '../lib/push'
+import { upsertPushDevice, disablePushDevice, hasFirebaseConfig, sendPushToUser } from '../lib/push'
 
 const app = new Hono()
 
@@ -300,6 +300,24 @@ app.get('/status', async (c) => {
   const outboxResult = await c.env.DB.prepare(`
     SELECT COUNT(*) AS count FROM agent_outbox WHERE user_id = ? AND status = 'pending'
   `).bind(auth.user.id).first()
+  const pushResult = await c.env.DB.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN enabled = 1 THEN 1 ELSE 0 END) AS enabled,
+      MAX(last_seen_at) AS last_seen_at,
+      MAX(last_push_at) AS last_push_at
+    FROM agent_push_devices
+    WHERE user_id = ?
+  `).bind(auth.user.id).first()
+  const lastPushError = await c.env.DB.prepare(`
+    SELECT last_push_error
+    FROM agent_push_devices
+    WHERE user_id = ?
+      AND last_push_error IS NOT NULL
+      AND last_push_error != ''
+    ORDER BY last_push_at DESC, updated_at DESC
+    LIMIT 1
+  `).bind(auth.user.id).first()
 
   return c.json({
     status: 'success',
@@ -308,6 +326,14 @@ app.get('/status', async (c) => {
       agent: config,
       pendingTasks: Number(pendingResult?.count || 0),
       pendingOutbox: Number(outboxResult?.count || 0),
+      push: {
+        firebaseConfigured: hasFirebaseConfig(c.env),
+        totalDevices: Number(pushResult?.total || 0),
+        enabledDevices: Number(pushResult?.enabled || 0),
+        lastSeenAt: pushResult?.last_seen_at ? Number(pushResult.last_seen_at) : null,
+        lastPushAt: pushResult?.last_push_at ? Number(pushResult.last_push_at) : null,
+        lastPushError: lastPushError?.last_push_error || null,
+      },
       now: nowMs(),
     },
   })
@@ -545,6 +571,29 @@ app.delete('/devices/push-token', async (c) => {
   const body = await c.req.json().catch(() => ({}))
   await disablePushDevice(c.env.DB, auth.user.id, body.token)
   return c.json({ status: 'success', data: { disabled: true, updatedAt: nowMs() } })
+})
+
+app.post('/devices/test-push', async (c) => {
+  const auth = await requireAgentAuth(c)
+  if (auth.error) return auth.error
+
+  const body = await c.req.json().catch(() => ({}))
+  const result = await sendPushToUser(c.env, auth.user.id, {
+    notification: {
+      title: normalizeString(body.title, 120) || 'Lucky幸运机',
+      body: normalizeString(body.body, 500) || '测试推送已发送',
+    },
+    data: {
+      test: '1',
+      outbox: '0',
+      createdAt: nowMs(),
+    },
+    android: {
+      channelId: normalizeString(body.channelId, 120),
+    },
+  })
+
+  return c.json({ status: 'success', data: result })
 })
 
 app.put('/client-presence', async (c) => {

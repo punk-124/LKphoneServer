@@ -84,6 +84,7 @@ All agent endpoints require `Authorization: Bearer <login-jwt>`.
 - `POST /agent/tasks`: Create a due task, such as a lifeline reminder
 - `PUT /agent/devices/push-token`: Register an Android FCM token for backend wake notifications
 - `DELETE /agent/devices/push-token`: Disable a registered Android FCM token
+- `POST /agent/devices/test-push`: Send a test FCM notification to registered devices
 - `GET /agent/outbox`: Pull pending server-side agent actions
 - `POST /agent/outbox/:id/ack`: Mark an outbox action as consumed
 

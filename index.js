@@ -606,8 +606,7 @@ const runAgentScheduler = async (env) => {
     if (await isUserClientActive(env, state.user_id, now)) continue
     const takeover = parseTakeover(state)
     const canWakeFrontend = takeover.proactiveWechat === true && Number(state.proactive_chat || 0) === 1
-    const canGenerateOffline = takeover.offlineDailyShare === true
-      && takeover.proactiveWechat === true
+    const canGenerateOffline = takeover.proactiveWechat === true
       && Number(state.proactive_chat || 0) === 1
       && state.offline_prompt_packet_json
     if (!canWakeFrontend && !canGenerateOffline) continue
